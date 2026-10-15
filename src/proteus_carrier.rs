@@ -236,9 +236,13 @@ impl Dispatch {
     }
 }
 
+/// Pause after an accept error that is not about one peer, descriptor
+/// exhaustion above all; the kernel keeps the backlog meanwhile.
+const ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
+
 /// Bind with SO_REUSEADDR (restart over TIME_WAIT) and SO_REUSEPORT (N daemons
-/// on one port, zero-downtime restarts).
-async fn bind_listener(bind_addr: &str) -> anyhow::Result<TcpListener> {
+/// on one port, zero-downtime restarts). An error here must stop start-up.
+pub fn listen(bind_addr: &str) -> anyhow::Result<TcpListener> {
     let addr: SocketAddr = bind_addr
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid bind address {bind_addr}: {e}"))?;
@@ -256,9 +260,38 @@ async fn bind_listener(bind_addr: &str) -> anyhow::Result<TcpListener> {
             e
         );
     }
-    sock.bind(&addr.into())?;
+    sock.bind(&addr.into())
+        .map_err(|e| anyhow::anyhow!("cannot bind {bind_addr}: {e}"))?;
     sock.listen(4096)?;
-    TcpListener::from_std(sock.into()).map_err(Into::into)
+    let listener = TcpListener::from_std(sock.into())?;
+    log::info!("[PROTEUS] Listening on {}", bind_addr);
+    Ok(listener)
+}
+
+/// Accept the next connection, waiting out errors instead of ending the
+/// listener and every tunnel with it.
+pub async fn accept(listener: &TcpListener) -> (TcpStream, SocketAddr) {
+    use std::io::ErrorKind::{ConnectionAborted, ConnectionRefused, ConnectionReset};
+    loop {
+        match listener.accept().await {
+            Ok(conn) => return conn,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    ConnectionAborted | ConnectionRefused | ConnectionReset
+                ) =>
+            {
+                log::debug!("[ACCEPT] a peer left before accept: {}", e)
+            }
+            Err(e) => {
+                let on = listener
+                    .local_addr()
+                    .map_or_else(|_| "?".to_string(), |a| a.to_string());
+                log::warn!("[ACCEPT] {on}: {e}; retrying in {ACCEPT_BACKOFF:?}");
+                tokio::time::sleep(ACCEPT_BACKOFF).await;
+            }
+        }
+    }
 }
 
 /// Peek (never consume) the first bytes until they classify or the deadline passes.
@@ -291,27 +324,21 @@ async fn peek_route(stream: &TcpStream, table: &Table) -> std::io::Result<Route>
     }
 }
 
-/// Listen on `bind` and serve every connection through the PSF its first
-/// bytes select. Under memory shedding a socket is dropped before any peek or
-/// buffer; a PROXY header, if enabled, is read before the first bytes are peeked.
+/// Serve every connection on `listener` through the PSF its first bytes
+/// select. Under memory shedding a socket is dropped before any peek or
+/// buffer; a PROXY header, if enabled, is read before the first bytes are
+/// peeked. Never returns: an accept error is waited out.
 pub async fn run(
-    bind: &str,
+    listener: TcpListener,
     dispatch: Arc<Dispatch>,
     server_keys: Arc<Vec<[u8; 32]>>,
     pp_mode: PpMode,
     egress_ips: Arc<[String]>,
     socket_sndbuf: usize,
     socket_rcvbuf: usize,
-) -> anyhow::Result<()> {
-    let listener = bind_listener(bind).await?;
-    log::info!(
-        "[PROTEUS] Listening on {} (proxy_protocol={:?})",
-        bind,
-        pp_mode
-    );
-
+) {
     loop {
-        let (stream, edge_peer) = listener.accept().await?;
+        let (stream, edge_peer) = accept(&listener).await;
         let _ = stream.set_nodelay(true);
 
         {
@@ -560,6 +587,17 @@ mod tests {
             err.contains("shadowsocks.psf still has the placeholder password"),
             "{err}"
         );
+    }
+
+    /// The error must reach the caller so start-up stops rather than serving
+    /// fewer addresses than configured.
+    #[tokio::test]
+    async fn a_port_held_without_reuseport_is_a_bind_error() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let err = listen(&held.local_addr().unwrap().to_string())
+            .expect_err("a held port must not bind")
+            .to_string();
+        assert!(err.contains("cannot bind 127.0.0.1:"), "{err}");
     }
 
     #[test]

@@ -86,7 +86,8 @@ Top level:
 `[proteus]` (the only listener):
 
 - `bind` — listen address, default `0.0.0.0:443`.
-- `extra_binds` — additional listen addresses for the same PSFs.
+- `extra_binds` — additional listen addresses for the same PSFs; a bind that
+  fails stops start-up.
 - `psfs` — protocol specification files, compiled once at start-up; at least
   one is required and the server refuses to start without one, or with one
   that does not compile, naming the file. Connections are told apart by the

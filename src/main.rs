@@ -246,8 +246,9 @@ async fn main() -> anyhow::Result<()> {
         config.relay.initial_buffer
     );
 
+    let listener = proteus_carrier::listen(bind_addr)?;
     for extra in &config.proteus.extra_binds {
-        let extra = extra.clone();
+        let extra_listener = proteus_carrier::listen(extra)?;
         let dispatch = dispatch.clone();
         let keys = server_keys.clone();
         let pp = config.proteus.proxy_protocol;
@@ -255,14 +256,18 @@ async fn main() -> anyhow::Result<()> {
         let snd = config.proteus.socket_sndbuf;
         let rcv = config.proteus.socket_rcvbuf;
         log::info!("  extra bind:     {}", extra);
-        tokio::spawn(async move {
-            if let Err(e) = proteus_carrier::run(&extra, dispatch, keys, pp, eg, snd, rcv).await {
-                log::error!("[PROTEUS] extra bind {} failed: {}", extra, e);
-            }
-        });
+        tokio::spawn(proteus_carrier::run(
+            extra_listener,
+            dispatch,
+            keys,
+            pp,
+            eg,
+            snd,
+            rcv,
+        ));
     }
     proteus_carrier::run(
-        bind_addr,
+        listener,
         dispatch,
         server_keys,
         config.proteus.proxy_protocol,
@@ -270,7 +275,7 @@ async fn main() -> anyhow::Result<()> {
         config.proteus.socket_sndbuf,
         config.proteus.socket_rcvbuf,
     )
-    .await?;
+    .await;
 
     Ok(())
 }
@@ -280,7 +285,7 @@ async fn run_metrics_endpoint(bind: &str) -> anyhow::Result<()> {
     log::info!("[METRICS] Listening on {}", bind);
 
     loop {
-        let (mut stream, _peer) = listener.accept().await?;
+        let (mut stream, _peer) = proteus_carrier::accept(&listener).await;
         tokio::spawn(async move {
             let mut buf = [0u8; 2048];
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf))

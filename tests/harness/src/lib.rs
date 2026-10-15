@@ -50,14 +50,16 @@ pub async fn start_server() -> Server {
     let sources = [(PSF_NAME.to_string(), PSF.to_string())];
     let dispatch = Arc::new(Dispatch::from_sources(&sources).unwrap());
     let client_proto = proteus_carrier::compile_text(PSF_NAME, PSF, Role::Client).unwrap();
-    let bind = addr.clone();
-    tokio::spawn(async move {
-        if let Err(e) =
-            proteus_carrier::run(&bind, dispatch, keys, PpMode::Disabled, egress, 0, 0).await
-        {
-            eprintln!("server exited: {e}");
-        }
-    });
+    let listener = proteus_carrier::listen(&addr).unwrap();
+    tokio::spawn(proteus_carrier::run(
+        listener,
+        dispatch,
+        keys,
+        PpMode::Disabled,
+        egress,
+        0,
+        0,
+    ));
     for _ in 0..200 {
         if TcpStream::connect(&addr).await.is_ok() {
             return Server {
