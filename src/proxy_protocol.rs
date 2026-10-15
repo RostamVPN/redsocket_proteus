@@ -63,6 +63,9 @@ pub async fn peek_and_strip(
     }
 }
 
+/// A header carrying a source address, or none to honour: no header, a v1
+/// `UNKNOWN` line, a v2 `LOCAL` command or an `AF_UNSPEC` family, for which the
+/// real connection endpoints apply.
 pub enum ProxyHeader {
     Present { src: SocketAddr },
     Absent,
@@ -114,9 +117,7 @@ async fn parse_v1(stream: &mut TcpStream, already_read: &[u8]) -> std::io::Resul
         ));
     }
     if parts[1] == "UNKNOWN" {
-        return Ok(ProxyHeader::Present {
-            src: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-        });
+        return Ok(ProxyHeader::Absent);
     }
     if parts.len() != 6 {
         return Err(std::io::Error::new(
@@ -145,11 +146,8 @@ async fn parse_v2(stream: &mut TcpStream) -> std::io::Result<ProxyHeader> {
     }
     let mut body = vec![0u8; body_len];
     stream.read_exact(&mut body).await?;
-    let cmd = ver_cmd & 0x0F;
-    if cmd == 0x0 {
-        return Ok(ProxyHeader::Present {
-            src: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-        });
+    if ver_cmd & 0x0F == 0x0 {
+        return Ok(ProxyHeader::Absent);
     }
     let family = fam_proto >> 4;
     match family {
@@ -174,9 +172,7 @@ async fn parse_v2(stream: &mut TcpStream) -> std::io::Result<ProxyHeader> {
                 src: SocketAddr::new(IpAddr::V6(Ipv6Addr::from(src_bytes)), src_port),
             })
         }
-        _ => Ok(ProxyHeader::Present {
-            src: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-        }),
+        _ => Ok(ProxyHeader::Absent),
     }
 }
 
@@ -241,10 +237,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v1_unknown_is_accepted_as_unspecified() {
-        let got = parse(b"PROXY UNKNOWN\r\n", PpMode::Auto).await.unwrap();
-        assert_eq!(got.ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-        assert_eq!(got.port(), 0);
+    async fn v1_unknown_falls_back_to_the_edge_peer() {
+        let (got, edge) = parse_with_edge(b"PROXY UNKNOWN\r\n", PpMode::Auto).await;
+        assert_eq!(got.unwrap(), edge);
     }
 
     #[tokio::test]
@@ -288,11 +283,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v2_local_command_is_unspecified() {
-        let got = parse(&v2(0x0, 0x1, &[0u8; 12]), PpMode::Auto)
-            .await
-            .unwrap();
-        assert_eq!(got.ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    async fn v2_local_and_unspec_fall_back_to_the_edge_peer() {
+        for h in [v2(0x0, 0x1, &[0u8; 12]), v2(0x1, 0x0, &[])] {
+            let (got, edge) = parse_with_edge(&h, PpMode::Auto).await;
+            assert_eq!(got.unwrap(), edge, "{h:02x?}");
+        }
     }
 
     #[tokio::test]
