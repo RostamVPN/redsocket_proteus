@@ -38,14 +38,13 @@ where
     }
 }
 
+/// The server's Noise public key; no product banner or carrier list, since any
+/// holder of that key can ask.
 async fn handle_config<S: AsyncWrite + Unpin>(
     stream: &mut S,
     server_pubkey_hex: &str,
 ) -> anyhow::Result<()> {
-    let body = format!(
-        r#"{{"noise_pubkey":"{}","carriers":["proteus"],"server":"redsocket-http"}}"#,
-        server_pubkey_hex
-    );
+    let body = format!(r#"{{"noise_pubkey":"{}"}}"#, server_pubkey_hex);
 
     let len_bytes = (body.len() as u32).to_be_bytes();
     stream.write_all(&len_bytes).await?;
@@ -62,19 +61,10 @@ async fn handle_ping<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> anyho
     Ok(())
 }
 
+/// The session's own cid; node-wide counters stay on the loopback metrics
+/// endpoint.
 async fn handle_stat<S: AsyncWrite + Unpin>(stream: &mut S, cid: &str) -> anyhow::Result<()> {
-    let (active, total) = (
-        crate::metrics::active_tunnels(),
-        crate::metrics::total_tunnels(),
-    );
-    let body = format!(
-        r#"{{"cid":"{}","active_tunnels":{},"total_tunnels":{},"bytes_up":{},"bytes_down":{}}}"#,
-        cid,
-        active,
-        total,
-        crate::metrics::total_bytes_up(),
-        crate::metrics::total_bytes_down()
-    );
+    let body = format!(r#"{{"cid":"{}"}}"#, cid);
     let len_bytes = (body.len() as u32).to_be_bytes();
     stream.write_all(&len_bytes).await?;
     stream.write_all(body.as_bytes()).await?;
@@ -120,8 +110,19 @@ mod tests {
         client.read_exact(&mut body).await.unwrap();
         assert_eq!(
             String::from_utf8(body).unwrap(),
-            r#"{"noise_pubkey":"abcd","carriers":["proteus"],"server":"redsocket-http"}"#
+            r#"{"noise_pubkey":"abcd"}"#
         );
+    }
+
+    #[tokio::test]
+    async fn stat_names_only_the_session() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        tokio::spawn(async move { handle_stat(&mut server, "0123").await.unwrap() });
+        let mut len = [0u8; 4];
+        client.read_exact(&mut len).await.unwrap();
+        let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
+        client.read_exact(&mut body).await.unwrap();
+        assert_eq!(String::from_utf8(body).unwrap(), r#"{"cid":"0123"}"#);
     }
 
     #[tokio::test]
