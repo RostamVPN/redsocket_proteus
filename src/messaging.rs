@@ -1456,7 +1456,7 @@ mod tests {
     #[test]
     fn rules_frames_are_bounded_to_single_destinations() {
         let ok = RulesUp {
-            allow: vec!["a.example".into(), "1.2.3.4".into(), "::1/128".into()],
+            allow: vec!["a.example".into(), "192.0.2.4".into(), "::1/128".into()],
             deny: vec!["b.example".into()],
             categories_off: 0,
         };

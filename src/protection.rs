@@ -1514,17 +1514,17 @@ mod tests {
             "2026-10-11",
             &[
                 (
-                    ip4("1.12.74.49"),
-                    ip4("1.12.74.49"),
+                    ip4("192.0.2.49"),
+                    ip4("192.0.2.49"),
                     BLOCK | CONTROLLER | RATING,
                 ),
-                (ip4("1.0.0.2"), ip4("1.0.0.255"), NOTIFY | SCANNER),
-                (ip4("2.26.225.0"), ip4("2.26.225.255"), BLOCK | PHISHING),
+                (ip4("192.0.2.100"), ip4("192.0.2.200"), NOTIFY | SCANNER),
+                (ip4("198.51.100.0"), ip4("198.51.100.255"), BLOCK | PHISHING),
                 (ip4("203.0.113.0"), ip4("203.0.113.255"), BLOCK | RATING),
             ],
             &[
                 (ip6("2001:db8::"), ip6("2001:db8::ffff"), NOTIFY | PROXY),
-                (ip6("2a06:1::1"), ip6("2a06:1::1"), BLOCK | CONTROLLER),
+                (ip6("2001:db8:1::1"), ip6("2001:db8:1::1"), BLOCK | CONTROLLER),
             ],
             &["evil.example", "xn--bad-example.test", "c2.bad.example"],
         )
@@ -1804,23 +1804,23 @@ mod tests {
         let signer = fixture::Signer::new();
         let b = parse_bundle(&sample(&signer), &signer.pubkey, &tiers()).unwrap();
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
-        assert_eq!(b.lookup_ip(&ip("1.12.74.49")), BLOCK | CONTROLLER | RATING);
-        assert_eq!(b.lookup_ip(&ip("1.12.74.48")), 0);
-        assert_eq!(b.lookup_ip(&ip("1.12.74.50")), 0);
-        assert_eq!(b.lookup_ip(&ip("1.0.0.2")), NOTIFY | SCANNER);
-        assert_eq!(b.lookup_ip(&ip("1.0.0.255")), NOTIFY | SCANNER);
-        assert_eq!(b.lookup_ip(&ip("1.0.0.1")), 0);
-        assert_eq!(b.lookup_ip(&ip("1.0.1.0")), 0);
-        assert_eq!(b.lookup_ip(&ip("2.26.225.180")), BLOCK | PHISHING);
+        assert_eq!(b.lookup_ip(&ip("192.0.2.49")), BLOCK | CONTROLLER | RATING);
+        assert_eq!(b.lookup_ip(&ip("192.0.2.48")), 0);
+        assert_eq!(b.lookup_ip(&ip("192.0.2.50")), 0);
+        assert_eq!(b.lookup_ip(&ip("192.0.2.100")), NOTIFY | SCANNER);
+        assert_eq!(b.lookup_ip(&ip("192.0.2.200")), NOTIFY | SCANNER);
+        assert_eq!(b.lookup_ip(&ip("192.0.2.99")), 0);
+        assert_eq!(b.lookup_ip(&ip("192.0.2.201")), 0);
+        assert_eq!(b.lookup_ip(&ip("198.51.100.180")), BLOCK | PHISHING);
         assert_eq!(b.lookup_ip(&ip("8.8.8.8")), 0);
         assert_eq!(b.lookup_ip(&ip("0.0.0.0")), 0);
         assert_eq!(b.lookup_ip(&ip("255.255.255.255")), 0);
         assert_eq!(b.lookup_ip(&ip("2001:db8::5")), NOTIFY | PROXY);
         assert_eq!(b.lookup_ip(&ip("2001:db8::1:0")), 0);
-        assert_eq!(b.lookup_ip(&ip("2a06:1::1")), BLOCK | CONTROLLER);
-        assert_eq!(b.lookup_ip(&ip("2a06:1::2")), 0);
+        assert_eq!(b.lookup_ip(&ip("2001:db8:1::1")), BLOCK | CONTROLLER);
+        assert_eq!(b.lookup_ip(&ip("2001:db8:1::2")), 0);
 
-        assert_eq!(b.lookup_ip(&ip("::ffff:2.26.225.1")), BLOCK | PHISHING);
+        assert_eq!(b.lookup_ip(&ip("::ffff:198.51.100.1")), BLOCK | PHISHING);
 
         let empty = parse_bundle(
             &fixture::build(&signer, "e", &[], &[], &[]),
@@ -1828,7 +1828,7 @@ mod tests {
             &tiers(),
         )
         .unwrap();
-        assert_eq!(empty.lookup_ip(&ip("1.2.3.4")), 0);
+        assert_eq!(empty.lookup_ip(&ip("192.0.2.1")), 0);
         assert_eq!(empty.lookup_ip(&ip("::1")), 0);
     }
 
@@ -2040,8 +2040,8 @@ mod tests {
         for ok in [
             "a.example",
             "x-y_z.example",
-            "1.2.3.4",
-            "1.2.3.4/32",
+            "192.0.2.4",
+            "192.0.2.4/32",
             "::1",
             "::1/128",
         ] {
@@ -2051,7 +2051,7 @@ mod tests {
             "",
             "10.0.0.0/8",
             "::/0",
-            "1.2.3.4/31",
+            "192.0.2.4/31",
             "a b.example",
             "a..b",
             "*.example",
