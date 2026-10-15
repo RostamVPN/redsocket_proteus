@@ -550,7 +550,7 @@ mod metrics_bind_tests {
         for b in [
             "0.0.0.0:9090",
             "[::]:9090",
-            "172.32.36.171:9090",
+            "203.0.113.171:9090",
             "192.168.1.5:9999",
         ] {
             let (eff, clamped) = cfg(b, false).effective_bind();

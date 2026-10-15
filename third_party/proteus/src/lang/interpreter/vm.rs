@@ -172,13 +172,21 @@ impl Execute for ConcretizeFormatArgs {
 
         // The following block is ryans hack to support padding.
         if let Some(padding_field_id) = &self.padding_field {
-            let block_size = self.block_size_nbytes.unwrap();
+            let block_size = match self.block_size_nbytes {
+                Some(n) if n > 0 => n,
+                _ => return Err(anyhow::anyhow!("padding needs a non-zero block size").into()),
+            };
 
             // Crummy hack. Infer the length of the payload field...
             let darrays = aformat.get_dynamic_arrays();
-            assert!(darrays.len() == 2);
+            if darrays.len() != 2 {
+                return Err(anyhow::anyhow!("padding needs exactly two dynamic arrays").into());
+            }
 
-            let payload_id = darrays.iter().find(|&id| id != padding_field_id).unwrap();
+            let payload_id = darrays
+                .iter()
+                .find(|&id| id != padding_field_id)
+                .ok_or_else(|| anyhow::anyhow!("padding needs a payload field"))?;
 
             // We know the payload bytes are there...
             let payload_bytes: &Bytes = runtime.load(payload_id)?;
@@ -261,13 +269,14 @@ impl Execute for DecryptFieldArgs {
                     err: e,
                 })?;
 
-            let mut mac_fixed = [0u8; 16];
-            mac_fixed.copy_from_slice(&mac);
+            let mac_fixed: [u8; 16] = mac[..].try_into().map_err(|_| {
+                anyhow::anyhow!("mac field is {} bytes, expected 16", mac.len())
+            })?;
 
-            runtime.decrypt(&ciphertext, &mac_fixed).unwrap()
+            runtime.decrypt(&ciphertext, &mac_fixed)?
         } else {
             // We are doing unauthenticated encryption.
-            runtime.decrypt_unauth(&ciphertext).unwrap()
+            runtime.decrypt_unauth(&ciphertext)?
         };
 
         let mut buf = BytesMut::with_capacity(plaintext.len());
@@ -291,7 +300,7 @@ impl Execute for EncryptFieldArgs {
         // TODO Should auth and unauth encrypt be separate instructions?
         if let Some(id) = &self.to_mac_heap_id {
             // We are doing authenticated encryption.
-            let (ciphertext, mac) = runtime.encrypt(&plaintext).unwrap();
+            let (ciphertext, mac) = runtime.encrypt(&plaintext)?;
 
             let mut buf = BytesMut::with_capacity(ciphertext.len());
             buf.put_slice(&ciphertext);
@@ -302,7 +311,7 @@ impl Execute for EncryptFieldArgs {
             runtime.store(id.clone(), buf.freeze())?;
         } else {
             // We are doing unauthenticated encryption.
-            let ciphertext = runtime.encrypt_unauth(&plaintext).unwrap();
+            let ciphertext = runtime.encrypt_unauth(&plaintext)?;
             let mut buf = BytesMut::with_capacity(ciphertext.len());
             buf.put_slice(&ciphertext);
             runtime.store(self.to_ciphertext_heap_id.clone(), buf.freeze())?;
@@ -360,19 +369,27 @@ impl Execute for InitFixedSharedKeyArgs {
 
 impl Execute for ReadArgs {
     async fn execute(&self, runtime: &mut impl Runtime) -> lang::Result<()> {
+        let short = || anyhow::anyhow!("wire length is smaller than the bytes already consumed");
         let len = match &self.from_len {
             ReadLength::Identifier(id) => {
                 let num: &u128 = runtime.load(id)?;
-                *num as usize
+                usize::try_from(*num).map_err(anyhow::Error::from)?
             }
             ReadLength::IdentifierMinus((id, sub)) => {
                 let num: &u128 = runtime.load(id)?;
-                (*num as usize) - sub
+                usize::try_from(*num)
+                    .map_err(anyhow::Error::from)?
+                    .checked_sub(*sub)
+                    .ok_or_else(short)?
             }
             ReadLength::IdentifierMinusMinus((id, id_sub, sub)) => {
                 let num: &u128 = runtime.load(id)?;
                 let num2: &u128 = runtime.load(id_sub)?;
-                (*num as usize) - (*num2 as usize) - sub
+                usize::try_from(*num)
+                    .map_err(anyhow::Error::from)?
+                    .checked_sub(usize::try_from(*num2).map_err(anyhow::Error::from)?)
+                    .and_then(|n| n.checked_sub(*sub))
+                    .ok_or_else(short)?
             }
             ReadLength::Fixed(val) => *val,
         };

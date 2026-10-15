@@ -277,8 +277,13 @@ library: `src/lib.rs` was added (`pub mod cli; pub mod crypto; pub mod lang;
 pub mod net; pub mod util;`), `src/main.rs` was reduced to a call into
 `proteus::cli::run`, and `src/lang/mod.rs` exports `pub mod types` so the
 server can read a parsed PSF's field semantics to find dispatch prefixes.
-Nothing else was touched; its own `LICENSE`, `README.md`,
-`rust-toolchain.toml` and tests are as upstream.
+A fourth edit hardens the interpreter against wire-controlled input:
+`src/lang/interpreter/vm.rs` returns errors where upstream unwrapped a
+failed decrypt or encrypt, a MAC field of the wrong size, an underflowing
+`length - N` expression or a padding format without a block size, and
+`src/lang/interpreter/io.rs` refuses a `read_exact` above 16 MiB. Under the
+release profile's `panic = "abort"` any of those used to end the process.
+Its own `LICENSE`, `README.md`, `rust-toolchain.toml` and tests are as upstream.
 
 ## Telemetry stats
 

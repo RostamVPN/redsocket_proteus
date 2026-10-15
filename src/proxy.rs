@@ -145,8 +145,8 @@ pub const DEFAULT_DENY_CIDRS: &[&str] = &[
     "ff00::/8",
 ];
 
-/// A parsed CIDR. Masking integers beats string prefixes: "151.243.11.70" is
-/// not inside 151.243.111.0/24, and a `starts_with` would say it is.
+/// A parsed CIDR. Masking integers beats string prefixes: "198.51.100.1" is
+/// not inside 198.51.100.100/30, and a `starts_with` on the text would say it is.
 #[derive(Debug, Clone, Copy)]
 pub struct Cidr {
     net: std::net::IpAddr,
@@ -731,7 +731,6 @@ mod tests {
         let allowed = [
             "8.8.8.8",
             "1.1.1.1",
-            "172.32.36.170",
             "100.63.255.255",
             "100.128.0.0",
             "198.17.255.255",
@@ -845,7 +844,7 @@ mod tests {
                 if v6 {
                     format!("2001:db8::{:x}", 0x120 + i)
                 } else {
-                    format!("172.32.36.{}", 178 + i)
+                    format!("203.0.113.{}", 178 + i)
                 }
             })
             .collect()
@@ -902,12 +901,12 @@ mod tests {
 
         let drained: Vec<String> = all
             .iter()
-            .filter(|s| *s != "172.32.36.178")
+            .filter(|s| *s != "203.0.113.178")
             .cloned()
             .collect();
         let after = assign(&drained);
         let moved = before.iter().zip(&after).filter(|(a, b)| a != b).count();
-        let was_on_it = before.iter().filter(|ip| *ip == "172.32.36.178").count();
+        let was_on_it = before.iter().filter(|ip| *ip == "203.0.113.178").count();
         assert_eq!(
             moved, was_on_it,
             "only the drained address's clients may move"
@@ -936,7 +935,7 @@ mod tests {
 
     #[test]
     fn egress_pick_is_per_family_and_stable_as_the_other_family_grows() {
-        let v4only: Vec<String> = vec!["172.33.21.20".into(), "172.33.21.21".into()];
+        let v4only: Vec<String> = vec!["198.51.100.20".into(), "198.51.100.21".into()];
         let mut mixed = v4only.clone();
         mixed.push("2a01:4f8::1".into());
         mixed.insert(0, "2a01:4f8::2".into());

@@ -7,6 +7,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::net::CHUNK_SIZE;
 
+/// Largest single read_exact a PSF may request; a wire-supplied length above it is an error.
+const MAX_READ_EXACT: usize = 16 * 1024 * 1024;
+
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("A normal end of file was reached on an io reader")]
@@ -195,6 +198,13 @@ where
 
         if let Some(e) = self.src_error.as_ref() {
             return Err(e.clone());
+        }
+
+        if len > MAX_READ_EXACT {
+            return Err(self.src_err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("read_exact({len}) exceeds the {MAX_READ_EXACT}-byte limit"),
+            )));
         }
 
         // Here we need to pre-allocate with the exactly requested len.
