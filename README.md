@@ -43,7 +43,8 @@ switch the node to this server.
 
 The client's address, as seen by the stats and the egress pinning, is the socket
 peer, or the source conveyed by a PROXY protocol header when `proxy_protocol`
-is on; there are no HTTP headers to carry it.
+is `required` (`auto` strips a header without trusting it, and a header must
+arrive in full within 5 s); there are no HTTP headers to carry it.
 
 ## Build
 

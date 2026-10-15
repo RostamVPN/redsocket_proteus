@@ -4,6 +4,7 @@
 //! PROXY protocol v1 + v2 parser.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
@@ -11,6 +12,8 @@ const V2_SIG: [u8; 12] = [
     0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
 ];
 const V1_PREFIX: &[u8] = b"PROXY ";
+/// How long a peer has to complete a PROXY header once one may be expected.
+const DEADLINE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PpMode {
@@ -34,8 +37,11 @@ impl<'de> serde::Deserialize<'de> for PpMode {
     }
 }
 
-/// Peek at first bytes; if PROXY header present, consume it and return real
-/// client addr. Otherwise return the edge peer unchanged.
+/// Consume a PROXY header if one is present and return the address to record
+/// for the connection: the header's source under `Required`, the socket peer
+/// otherwise. `Auto` strips a header without trusting it, since any direct
+/// peer could have written one. A header not completed within [`DEADLINE`] is
+/// an error.
 pub async fn peek_and_strip(
     stream: &mut TcpStream,
     edge_peer: SocketAddr,
@@ -44,6 +50,21 @@ pub async fn peek_and_strip(
     if matches!(mode, PpMode::Disabled) {
         return Ok(edge_peer);
     }
+    tokio::time::timeout(DEADLINE, strip(stream, edge_peer, mode))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "PROXY header not completed in time",
+            )
+        })?
+}
+
+async fn strip(
+    stream: &mut TcpStream,
+    edge_peer: SocketAddr,
+    mode: PpMode,
+) -> std::io::Result<SocketAddr> {
     let mut probe = [0u8; 12];
     let n = stream.peek(&mut probe).await?;
     let is_v2 = n >= 12 && probe == V2_SIG;
@@ -58,8 +79,8 @@ pub async fn peek_and_strip(
         };
     }
     match accept_optional(stream).await? {
-        ProxyHeader::Present { src } => Ok(src),
-        ProxyHeader::Absent => Ok(edge_peer),
+        ProxyHeader::Present { src } if mode == PpMode::Required => Ok(src),
+        _ => Ok(edge_peer),
     }
 }
 
@@ -218,7 +239,7 @@ mod tests {
     async fn v1_tcp4_yields_the_real_client() {
         let got = parse(
             b"PROXY TCP4 203.0.113.7 10.0.0.1 51234 80\r\n",
-            PpMode::Auto,
+            PpMode::Required,
         )
         .await
         .unwrap();
@@ -229,7 +250,7 @@ mod tests {
     async fn v1_tcp6_yields_the_real_client() {
         let got = parse(
             b"PROXY TCP6 2606:4700::1 2606:4700::2 51234 80\r\n",
-            PpMode::Auto,
+            PpMode::Required,
         )
         .await
         .unwrap();
@@ -278,8 +299,53 @@ mod tests {
         body.extend_from_slice(&[10, 0, 0, 1]);
         body.extend_from_slice(&4242u16.to_be_bytes());
         body.extend_from_slice(&80u16.to_be_bytes());
-        let got = parse(&v2(0x1, 0x1, &body), PpMode::Auto).await.unwrap();
+        let got = parse(&v2(0x1, 0x1, &body), PpMode::Required)
+            .await
+            .unwrap();
         assert_eq!(got, "203.0.113.9:4242".parse::<SocketAddr>().unwrap());
+    }
+
+    /// Any direct peer can write a header, so `Auto` strips one without
+    /// recording its address.
+    #[tokio::test]
+    async fn auto_strips_a_header_but_records_the_edge_peer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let writer = tokio::spawn(async move {
+            let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+            c.write_all(b"PROXY TCP4 203.0.113.7 10.0.0.1 51234 80\r\nhello")
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        });
+        let (mut server, edge) = listener.accept().await.unwrap();
+        let got = peek_and_strip(&mut server, edge, PpMode::Auto).await.unwrap();
+        assert_eq!(got, edge);
+        let mut rest = [0u8; 5];
+        server.read_exact(&mut rest).await.unwrap();
+        assert_eq!(&rest, b"hello", "the header must still be consumed");
+        writer.abort();
+    }
+
+    /// A peer that opens a header and stalls is closed at the deadline instead
+    /// of holding a task until it leaves.
+    #[tokio::test]
+    async fn a_stalled_header_is_an_error_at_the_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let writer = tokio::spawn(async move {
+            let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+            c.write_all(b"PROXY ").await.unwrap();
+            tokio::time::sleep(DEADLINE * 4).await;
+        });
+        let (mut server, edge) = listener.accept().await.unwrap();
+        let started = std::time::Instant::now();
+        let err = peek_and_strip(&mut server, edge, PpMode::Auto)
+            .await
+            .expect_err("a stalled header was accepted");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < DEADLINE * 2, "{:?}", started.elapsed());
+        writer.abort();
     }
 
     #[tokio::test]

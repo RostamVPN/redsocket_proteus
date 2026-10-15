@@ -27,8 +27,11 @@ extra_binds = []
 # bytes (shadowsocks) takes everything else. Write the shadowsocks password into
 # your copy of that file before use.
 psfs = ["proteus/tls_mimic.psf", "proteus/shadowsocks.psf"]
-# "disabled" unless every connection arrives through a load balancer that
-# prepends a PROXY header; "auto" trusts a PROXY header from any peer.
+# "disabled" unless connections arrive through a load balancer that prepends a
+# PROXY header. "required" records the header's source address and refuses a
+# connection without one, so use it only where the port is reachable solely
+# through the load balancer; "auto" strips a header if present but records the
+# socket peer, since any direct peer could write one.
 proxy_protocol = "disabled"
 # Socket buffer sizes in bytes; 0 leaves kernel autotuning in place.
 socket_sndbuf = 0

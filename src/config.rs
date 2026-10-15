@@ -67,8 +67,9 @@ pub struct ProteusConfig {
     pub socket_sndbuf: usize,
     #[serde(default)]
     pub socket_rcvbuf: usize,
-    /// PROXY protocol v1/v2 ahead of the interpreter, so a load balancer can
-    /// still convey the peer address. Off unless asked for.
+    /// PROXY protocol v1/v2 ahead of the interpreter: `required` records the
+    /// source a load balancer conveys, `auto` strips a header without trusting
+    /// it. Off unless asked for.
     #[serde(default)]
     pub proxy_protocol: PpMode,
 }
