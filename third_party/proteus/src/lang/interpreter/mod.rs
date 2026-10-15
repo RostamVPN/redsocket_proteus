@@ -187,7 +187,7 @@ where
     fn log_completion(&self, app_to_net_res: &str, net_to_app_res: &str) {
         let ((app_in, net_out), (net_in, app_out)) = self.num_bytes_forwarded();
 
-        log::info!(
+        log::debug!(
             "Interpreter done: \
             AppToNet({}➡{}, {}), \
             NetToApp({}➡{}, {})",

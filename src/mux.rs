@@ -42,7 +42,7 @@ where
         let os = parts.get(3).unwrap_or(&"");
         let cid = parts.get(4).unwrap_or(&"");
         let sni = parts.get(5).unwrap_or(&"");
-        log::info!(
+        log::debug!(
             "[MUX2] tunnel open: tz={} app={} os={} cid={} sni={} ip={}",
             tz,
             app,
@@ -297,7 +297,7 @@ async fn handle_muxed_stream(
         stream.write_all(&SOCKS5_OK).await?;
         stream.flush().await?;
         let cid_ref = client_cid.as_deref().unwrap_or("");
-        log::info!("[MUX2] _rs control: {} (cid={})", host, cid_ref);
+        log::debug!("[MUX2] _rs control: {} (cid={})", host, cid_ref);
         return crate::control::handle(&mut stream, &host, &server_pubkey_hex, cid_ref).await;
     }
 

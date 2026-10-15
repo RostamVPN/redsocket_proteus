@@ -151,7 +151,7 @@ where
     let (host, port) = crate::proxy::parse_connect_request(&connect_pt)?;
 
     if crate::proxy::is_control_channel(&host) {
-        log::info!(
+        log::debug!(
             "[_rs] control CONNECT: {} (ip={} cid={})",
             host,
             real_ip,

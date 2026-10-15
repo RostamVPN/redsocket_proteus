@@ -164,6 +164,7 @@ impl Table {
 
 /// The compiled PSFs of a listener, with their dispatch table.
 pub struct Dispatch {
+    /// File names without their directories, for the log.
     names: Vec<String>,
     protos: Vec<TaskGraphImpl>,
     table: Table,
@@ -202,7 +203,11 @@ impl Dispatch {
                     ),
                 },
             }
-            names.push(name.clone());
+            names.push(
+                std::path::Path::new(name)
+                    .file_name()
+                    .map_or_else(|| name.clone(), |f| f.to_string_lossy().into_owned()),
+            );
         }
         Ok(Self {
             names,
@@ -523,6 +528,12 @@ mod tests {
             d.describe(),
             "tls_mimic.psf (prefix 166 bytes), shadowsocks.psf (default)"
         );
+        let by_path = Dispatch::from_sources(&[(
+            "/etc/redsocket/proteus/tls_mimic.psf".to_string(),
+            TLS_MIMIC.to_string(),
+        )])
+        .unwrap();
+        assert_eq!(by_path.describe(), "tls_mimic.psf (prefix 166 bytes)");
     }
 
     #[test]

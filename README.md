@@ -201,8 +201,8 @@ bind = "0.0.0.0:443"
 psfs = ["/etc/redsocket/proteus/tls_mimic.psf", "/etc/redsocket/proteus/shadowsocks.psf"]
 ```
 
-The start-up log line `proteus psfs:` names each PSF with `(prefix N bytes)` or
-`(default)`. Limits, by design:
+The start-up log line `proteus psfs:` names each PSF by file name with
+`(prefix N bytes)` or `(default)`. Limits, by design:
 
 - there is no version byte or other marker; dispatch relies on what a PSF's
   first client message looks like;
@@ -285,7 +285,9 @@ A fourth edit hardens the interpreter against wire-controlled input:
 failed decrypt or encrypt, a MAC field of the wrong size, an underflowing
 `length - N` expression or a padding format without a block size, and
 `src/lang/interpreter/io.rs` refuses a `read_exact` above 16 MiB. Under the
-release profile's `panic = "abort"` any of those used to end the process.
+release profile's `panic = "abort"` any of those used to end the process. A
+fifth edit logs the interpreter's per-connection completion line in
+`src/lang/interpreter/mod.rs` at `debug` instead of `info`.
 Its own `LICENSE`, `README.md`, `rust-toolchain.toml` and tests are as upstream.
 
 ## Telemetry stats
