@@ -34,10 +34,6 @@ struct Cli {
     #[arg(long)]
     bind: Option<String>,
 
-    /// Override private key (hex, 64 chars).
-    #[arg(long)]
-    private_key: Option<String>,
-
     /// Override public key (hex, 64 chars).
     #[arg(long)]
     public_key: Option<String>,
@@ -64,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
 
     let config = config::Config::load(&cli.config)?;
 
-    let private_key_hex = cli.private_key.as_deref().unwrap_or(&config.private_key);
+    let private_key_hex = &config.private_key;
     let public_key_hex = cli.public_key.as_deref().unwrap_or(&config.public_key);
     let bind_addr = cli.bind.as_deref().unwrap_or(&config.proteus.bind);
 

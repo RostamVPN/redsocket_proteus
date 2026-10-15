@@ -2019,7 +2019,7 @@ mod tests {
             "Example.COM".into(),
             "10.9.0.0/16".into(),
             "10.9.1.1/32".into(),
-            "2606:4700::1111".into(),
+            "2001:db8::1111".into(),
             "".into(),
         ]);
         assert!(rules.allows_host("example.com"));
@@ -2034,7 +2034,7 @@ mod tests {
             "the /16 does not: wider than one destination"
         );
         assert!(!rules.allows_ip(&"10.10.1.1".parse().unwrap()));
-        assert!(rules.allows_ip(&"2606:4700::1111".parse().unwrap()));
+        assert!(rules.allows_ip(&"2001:db8::1111".parse().unwrap()));
         assert!(UserRules::default().is_empty());
 
         for ok in [

@@ -809,9 +809,9 @@ mod tests {
     #[test]
     fn preferred_family_goes_first_and_the_other_stays_as_fallback() {
         let dual = [
-            sa("1.2.3.4:443"),
-            sa("[2606:4700::1]:443"),
-            sa("5.6.7.8:443"),
+            sa("203.0.113.4:443"),
+            sa("[2001:db8::1]:443"),
+            sa("203.0.113.8:443"),
             sa("[2606:4700::2]:443"),
         ];
         let v6first = order_by_family(&dual, true);
@@ -834,7 +834,7 @@ mod tests {
         );
 
         assert_eq!(order_by_family(&many, true).len(), 6);
-        assert!(order_by_family(&[sa("[2606:4700::1]:80")], false)[0].is_ipv6());
+        assert!(order_by_family(&[sa("[2001:db8::1]:80")], false)[0].is_ipv6());
         assert!(order_by_family(&[], true).is_empty());
     }
 
@@ -862,7 +862,7 @@ mod tests {
         );
 
         let mut dual = eight.clone();
-        dual.push(sa("[2606:2800:220:1::1]:443"));
+        dual.push(sa("[2001:db8:220:1::1]:443"));
         let ordered = order_by_family(&dual, false);
         assert_eq!(ordered.len(), 9);
         assert!(ordered[..8].iter().all(|a| a.is_ipv4()));
@@ -937,8 +937,8 @@ mod tests {
     fn egress_pick_is_per_family_and_stable_as_the_other_family_grows() {
         let v4only: Vec<String> = vec!["198.51.100.20".into(), "198.51.100.21".into()];
         let mut mixed = v4only.clone();
-        mixed.push("2a01:4f8::1".into());
-        mixed.insert(0, "2a01:4f8::2".into());
+        mixed.push("2001:db8:4f8::1".into());
+        mixed.insert(0, "2001:db8:4f8::2".into());
 
         for cid in ["cid-alpha-0001", "user_8f2c9a71", "0042:android:us"] {
             assert_eq!(
@@ -957,18 +957,18 @@ mod tests {
 
     #[test]
     fn udp_header_roundtrip_and_bounds() {
-        let from: std::net::SocketAddr = "1.2.3.4:443".parse().unwrap();
+        let from: std::net::SocketAddr = "203.0.113.4:443".parse().unwrap();
         let mut dgram = udp_header(&from);
         dgram.extend_from_slice(b"quic");
         let (host, port, off) = parse_udp_header(&dgram).unwrap();
-        assert_eq!((host.as_str(), port), ("1.2.3.4", 443));
+        assert_eq!((host.as_str(), port), ("203.0.113.4", 443));
         assert_eq!(&dgram[off..], b"quic");
 
-        let from6: std::net::SocketAddr = "[2606:4700::1111]:53".parse().unwrap();
+        let from6: std::net::SocketAddr = "[2001:db8::1111]:53".parse().unwrap();
         let mut d6 = udp_header(&from6);
         d6.extend_from_slice(b"x");
         let (h6, p6, off6) = parse_udp_header(&d6).unwrap();
-        assert_eq!((h6.as_str(), p6), ("2606:4700::1111", 53));
+        assert_eq!((h6.as_str(), p6), ("2001:db8::1111", 53));
         assert_eq!(&d6[off6..], b"x");
 
         let dom = [

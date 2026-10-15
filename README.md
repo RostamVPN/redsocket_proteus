@@ -65,9 +65,9 @@ speaks the same PSF). The relay is the tokio relay on every platform.
     redsocket-http --keygen
 
 prints a fresh `private_key` / `public_key` pair (hex). Put both in the config;
-clients need only the public key. `--config`, `--bind`, `--private-key` and
-`--public-key` override the file at start-up; `--bind` replaces
-`[proteus] bind`.
+clients need only the public key. `--config`, `--bind` and `--public-key`
+override the file at start-up; `--bind` replaces `[proteus] bind`. The private
+key is read from the file only, so it never appears in a process list.
 
 ## Configuration (`config.toml`)
 
