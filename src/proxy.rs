@@ -812,7 +812,7 @@ mod tests {
             sa("203.0.113.4:443"),
             sa("[2001:db8::1]:443"),
             sa("203.0.113.8:443"),
-            sa("[2606:4700::2]:443"),
+            sa("[2001:db8::2]:443"),
         ];
         let v6first = order_by_family(&dual, true);
         assert!(v6first[0].is_ipv6() && v6first[1].is_ipv6(), "{v6first:?}");
@@ -822,7 +822,7 @@ mod tests {
 
         let many: Vec<_> = (1..=6).map(|i| sa(&format!("10.0.0.{i}:80"))).collect();
         let mut mixed = many.clone();
-        mixed.push(sa("[2606:4700::9]:80"));
+        mixed.push(sa("[2001:db8::9]:80"));
         let ordered = order_by_family(&mixed, true);
         assert_eq!(ordered.len(), 7, "1 v6 + all 6 v4: {ordered:?}");
         assert!(ordered[0].is_ipv6());
