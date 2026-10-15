@@ -1,5 +1,5 @@
 server = "127.0.0.1:443"
-pubkey = "e644c8a4dbc44c56b2e2a1f2587a785fc5813aba74674e151455d51cf86dc405"
+pubkey = "REPLACE_WITH_SERVER_PUBLIC_KEY"
 
 listen = 1080
 

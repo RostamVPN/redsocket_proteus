@@ -1,7 +1,8 @@
 # redsocket_proteus example configuration. Generate the keypair with
-# `redsocket-http --keygen`; the public key goes into the client config.
-private_key = "cd03cbd5399e96297438d5ce91290aeaf7c2cf9ce0a7e561c87522afe9865c34"
-public_key  = "e644c8a4dbc44c56b2e2a1f2587a785fc5813aba74674e151455d51cf86dc405"
+# `redsocket-http --keygen`; the public key goes into the client config. The
+# server refuses to start with these placeholders or with a published key.
+private_key = "REPLACE_WITH_PRIVATE_KEY"
+public_key  = "REPLACE_WITH_PUBLIC_KEY"
 # Previous private keys still accepted during a rotation.
 extra_private_keys = []
 

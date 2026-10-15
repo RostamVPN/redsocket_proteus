@@ -150,7 +150,8 @@ a config without `[proteus] psfs` is an error.
 (the last two together enable client-certificate auth).
 
 `config.example.toml` is a complete, commented example that runs both shipped
-PSFs on one port.
+PSFs on one port; generate its keypair with `--keygen`, since the server refuses
+the `REPLACE_WITH_*` placeholders and the key the example once shipped with.
 
 ## Proteus carrier
 

@@ -316,6 +316,26 @@ fn default_metrics_bind() -> String {
     "127.0.0.1:9090".to_string()
 }
 
+/// The private key `config.example.toml` shipped before it carried placeholders;
+/// a node using it is impersonable by anyone who read the repository.
+const PUBLISHED_EXAMPLE_PRIVATE_KEY: &str =
+    "cd03cbd5399e96297438d5ce91290aeaf7c2cf9ce0a7e561c87522afe9865c34";
+
+/// What a private key must satisfy before it is used: 64 hex chars, not a
+/// `REPLACE_WITH_*` placeholder and not the published example key.
+pub fn check_private_key(what: &str, hex: &str) -> anyhow::Result<()> {
+    if hex.starts_with("REPLACE_WITH_") {
+        anyhow::bail!("{what} is still the example placeholder; generate a keypair with --keygen");
+    }
+    if hex == PUBLISHED_EXAMPLE_PRIVATE_KEY {
+        anyhow::bail!("{what} is the published example key; generate a keypair with --keygen");
+    }
+    if hex.len() != 64 {
+        anyhow::bail!("{what} must be 64 hex chars (32 bytes), got {}", hex.len());
+    }
+    Ok(())
+}
+
 impl Config {
     pub fn load(path: &str) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)
@@ -328,12 +348,7 @@ impl Config {
 
     /// What a parsed config must satisfy before the server starts.
     fn validate(&self) -> anyhow::Result<()> {
-        if self.private_key.len() != 64 {
-            anyhow::bail!(
-                "private_key must be 64 hex chars (32 bytes), got {}",
-                self.private_key.len()
-            );
-        }
+        check_private_key("private_key", &self.private_key)?;
         if self.public_key.len() != 64 {
             anyhow::bail!(
                 "public_key must be 64 hex chars (32 bytes), got {}",
@@ -341,12 +356,7 @@ impl Config {
             );
         }
         for (i, k) in self.extra_private_keys.iter().enumerate() {
-            if k.len() != 64 {
-                anyhow::bail!(
-                    "extra_private_keys[{i}] must be 64 hex chars, got {}",
-                    k.len()
-                );
-            }
+            check_private_key(&format!("extra_private_keys[{i}]"), k)?;
         }
         if self.proteus.psfs.is_empty() {
             anyhow::bail!(
@@ -519,6 +529,28 @@ unknown_stats_flag = true
             parse(MINIMAL).validate().is_err(),
             "short keys are still refused"
         );
+    }
+
+    #[test]
+    fn the_published_example_key_and_the_placeholders_are_refused() {
+        let keyed = |k: &str, extra: &str| {
+            format!(
+                "private_key = \"{k}\"\npublic_key = \"{}\"\n{extra}[proteus]\npsfs = [\"x.psf\"]\n",
+                "b".repeat(64)
+            )
+        };
+        for k in [PUBLISHED_EXAMPLE_PRIVATE_KEY, "REPLACE_WITH_PRIVATE_KEY"] {
+            let err = parse(&keyed(k, "")).validate().unwrap_err().to_string();
+            assert!(err.contains("--keygen"), "{err}");
+        }
+        let own = "a".repeat(64);
+        assert!(parse(&keyed(&own, "")).validate().is_ok());
+        let rotation = format!("extra_private_keys = [\"{PUBLISHED_EXAMPLE_PRIVATE_KEY}\"]\n");
+        let err = parse(&keyed(&own, &rotation))
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("extra_private_keys[0]"), "{err}");
     }
 
     #[test]

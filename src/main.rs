@@ -68,9 +68,7 @@ async fn main() -> anyhow::Result<()> {
     let public_key_hex = cli.public_key.as_deref().unwrap_or(&config.public_key);
     let bind_addr = cli.bind.as_deref().unwrap_or(&config.proteus.bind);
 
-    if private_key_hex.len() != 64 {
-        anyhow::bail!("private_key must be 64 hex chars");
-    }
+    config::check_private_key("private_key", private_key_hex)?;
 
     let private_key_bytes = {
         let bytes = hex::decode(private_key_hex)
