@@ -1,0 +1,106 @@
+# redsocket_http example configuration. Generate the keypair with
+# `redsocket-http --keygen`; the public key goes into the client config.
+private_key = "cd03cbd5399e96297438d5ce91290aeaf7c2cf9ce0a7e561c87522afe9865c34"
+public_key  = "e644c8a4dbc44c56b2e2a1f2587a785fc5813aba74674e151455d51cf86dc405"
+# Previous private keys still accepted during a rotation.
+extra_private_keys = []
+
+# Source addresses for outbound connections; empty uses the OS default.
+# A client is pinned to one address per family for its session.
+egress_ips = []
+# Dial a destination's IPv6 address first; ignored when the node has no IPv6 route.
+prefer_ipv6 = false
+# Destinations refused before any connect. Omit to keep the built-in set
+# (loopback, private, link-local, documentation, multicast, reserved).
+# deny_cidrs = ["10.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16"]
+# Carve-outs checked before deny_cidrs.
+allow_cidrs = []
+
+[http]
+bind = "0.0.0.0:80"
+extra_binds = []
+# "disabled" unless every connection arrives through a load balancer that
+# prepends a PROXY header; "auto" trusts a PROXY header from any peer.
+proxy_protocol = "disabled"
+# Only these Host values receive a 101; empty allows any Upgrade request.
+allowed_upgrade_hosts = []
+# Socket buffer sizes in bytes; 0 leaves kernel autotuning in place.
+socket_sndbuf = 0
+socket_rcvbuf = 0
+# Same-port Proteus: wrapped and plain clients share bind, told apart by their first bytes.
+# proteus_psfs = ["/etc/redsocket/proteus/tls_mimic.psf", "/etc/redsocket/proteus/shadowsocks.psf"]
+
+# Dedicated Proteus listener; every connection on it is wrapped in the PSF.
+# [proteus]
+# Listen address of the Proteus-wrapped carrier.
+# bind = "0.0.0.0:443"
+# Protocol specification file, compiled once at start-up.
+# psf = "/etc/redsocket/proteus/tls_mimic.psf"
+# More listen addresses for the same PSF.
+# extra_binds = []
+
+[metrics]
+# Loopback unless allow_public is true.
+bind = "127.0.0.1:9090"
+allow_public = false
+
+[stats]
+# Per-tunnel cid presence rows and usage records, sent to the Valkey below.
+cids = true
+
+# [stats.valkey]
+# addr = "valkey.example.net:6380"
+# password = "REPLACE_WITH_PASSWORD"
+# ca_file = "/etc/redsocket/valkey-ca.crt"
+# server_name = "valkey.example.net"
+
+[relay]
+# Initial relay buffer size in bytes; 0 allocates the full 64K/32K up front.
+initial_buffer = 0
+# "epoll" or "iouring" (Linux only).
+io_backend = "epoll"
+
+[shed]
+# Refuse new tunnels above high_pct of the memory limit, resume below low_pct.
+enabled = true
+high_pct = 88
+low_pct = 80
+interval_secs = 2
+
+[protection]
+# Exit-side destination verdicts for MUX2 clients that announce `blk1`.
+enabled = false
+# Ed25519 public key (64 hex) that signs the bundle's meta.json.
+pubkey = ""
+# META `app` values whose `blk1` tunnels are checked.
+brands = ["rostam"]
+# Never judged: exact names or `*.suffix`.
+allow_hosts = ["rostam.app", "*.rostam.app", "*.cloudfront.net", "*.amazonaws.com"]
+block_bits = ["controller", "malware", "phishing", "orb", "rating_malicious"]
+notify_bits = []
+reload_secs = 300
+# Load the bundle from a directory instead of Valkey (testing).
+bundle_dir = ""
+debug_log_destinations = false
+
+# [protection.valkey]
+# addr = "valkey.example.net:6379"
+# tls = true
+# server_name = "valkey.example.net"
+# password = "REPLACE_WITH_PASSWORD"
+# ca_file = "/etc/redsocket/valkey/ca.crt"
+# cert_file = "/etc/redsocket/valkey/client.crt"
+# key_file = "/etc/redsocket/valkey/client.key"
+
+[messaging]
+# Mailbox control stream for MUX2 clients that announce `msg1`.
+enabled = false
+
+# [messaging.valkey]
+# addr = "valkey.example.net:6379"
+# tls = true
+# server_name = "valkey.example.net"
+# password = "REPLACE_WITH_PASSWORD"
+# ca_file = "/etc/redsocket/valkey/ca.crt"
+# cert_file = "/etc/redsocket/valkey/client.crt"
+# key_file = "/etc/redsocket/valkey/client.key"

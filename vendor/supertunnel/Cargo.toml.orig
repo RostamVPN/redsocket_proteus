@@ -1,0 +1,29 @@
+[package]
+name = "supertunnel"
+version = "0.1.0"
+edition = "2024"
+description = "Build stateful proxy tunnels that resist network disruptions."
+readme = "README.md"
+license-file = "LICENSE.txt"
+keywords = ["proxy", "networking", "session"]
+categories = ["asynchronous", "network-programming"]
+repository = "https://github.com/unblockable/supertunnel"
+
+[dependencies]
+bytes = "1.11"
+futures = "0.3"
+log = "0.4"
+pin-project-lite = "0.2"
+rand = "0.10"
+rand_core = "0.10"
+tokio = { version = "1.49", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["codec", "io"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[dev-dependencies]
+clap = { version = "4.6", features = ["derive"] }
+env_logger = "0.11"
+fast-socks5 = "1.0"
+itertools = "0.14"
+tokio-test = "0.4"

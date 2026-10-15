@@ -1,0 +1,106 @@
+WHITESPACE = _{ " " | "\t" | NEWLINE }
+COMMENT = _{ "//" ~ (!"\n" ~ ANY)* }
+
+identifier = @{ ("_"|"-"|ASCII_ALPHA)~("_"|"-"|ASCII_ALPHANUMERIC)* }
+
+name_value = { "NAME" ~ ":" ~ identifier }
+type_value = { "TYPE" ~ ":" ~ (primitive_type | array) }
+
+field = { "{" ~ name_value ~ ";" ~ type_value ~ "}" }
+
+size_of_op = ${ identifier~".size_of" }
+
+primitive_array = { "[" ~ primitive_type ~ ";" ~ positive_numeric_literal ~ "]" }
+dynamic_array = { "[" ~ "u8" ~ ";" ~ size_of_op ~ "]" }
+array = { primitive_array | dynamic_array }
+
+numeric_type = { "u8" | "u16" | "u32" | "u64" | "i8" | "i16" | "i32" | "i64" }
+primitive_type = { numeric_type | "bool" | "char" }
+
+numeric_literal = @{ "-"?~positive_numeric_literal }
+positive_numeric_literal = @{ ASCII_DIGIT+ }
+typed_numeric_literal = @{ numeric_literal~numeric_type }
+
+hex_literal = @{ "0x" ~ ASCII_HEX_DIGIT+ }
+
+string_literal = ${ "\"" ~ inner ~ "\"" }
+inner = @{ char* }
+char = {
+    !("\"" | "\\") ~ ANY
+    | "\\" ~ ("\"" | "\\" | "/" | "b" | "f" | "n" | "r" | "t")
+    | "\\" ~ ("u" ~ ASCII_HEX_DIGIT{4})
+}
+
+format = { "DEFINE" ~ identifier ~ field ~ ("," ~ field)* ~ ";" }
+
+fixed_string_semantic = { "FIXED_STRING" ~ "(" ~ string_literal ~ ")" }
+
+fixed_bytes_semantic = { "FIXED_BYTES" ~ "(" ~ hex_literal ~ ")" }
+
+randomness_semantic = { "RANDOM" ~ "(" ~ positive_numeric_literal ~ ")" }
+
+pubkey_encoding = { "RAW" | "DER" | "PEM" }
+
+pubkey_semantic = { "PUBKEY" ~ "(" ~ pubkey_encoding ~ ")" }
+
+field_semantic = { fixed_string_semantic | fixed_bytes_semantic |
+                   randomness_semantic | pubkey_semantic |
+                   "PADDING_LENGTH" | "PADDING" | "PAYLOAD" | "LENGTH" }
+
+semantic_binding = { "{" ~
+  "FORMAT" ~ ":" ~ identifier ~ ";" ~
+  "FIELD" ~ ":" ~ identifier ~ ";" ~
+  "SEMANTIC" ~ ":" ~ field_semantic ~ "}" ~ ";" }
+
+role = { "CLIENT" | "SERVER" }
+
+phase = { "HANDSHAKE" | "DATA" }
+
+sequence_specifier = { "{" ~
+  "ROLE" ~ ":" ~ role ~ ";" ~
+  "PHASE" ~ ":" ~ phase ~ ";" ~
+  "FORMAT" ~ ":" ~ identifier ~ "}" ~ ";" }
+
+psf = { SOI ~ "@SEGMENT.FORMATS" ~ format+ ~
+        "@SEGMENT.SEMANTICS" ~ semantic_binding* ~
+        "@SEGMENT.SEQUENCE" ~ sequence_specifier+ ~
+        crypto_segment? ~
+        options_segment? ~
+        EOI }
+
+password_assignment = {"PASSWORD" ~ "=" ~ string_literal ~ ";" }
+
+cipher = { "CHACHA20-POLY1305" | "AES256GCM" | "AES128GCM" }
+
+mac_name = { identifier | "NULL" }
+
+cipher_assignment = { "CIPHER" ~ "=" ~ cipher ~ ";" }
+
+encryption_format_binding = { "ENCRYPT" ~ identifier ~ "FROM" ~ identifier }
+
+encryption_field_directive = { "{" ~
+                               "PTEXT" ~ ":" ~ identifier ~ ";" ~
+                               "CTEXT" ~ ":" ~ identifier ~ ";" ~
+                               "MAC"   ~ ":" ~ mac_name ~ "}" }
+
+encryption_directives = { encryption_format_binding ~
+                          encryption_field_directive ~
+                          ("," ~ encryption_field_directive)* ~ ";" }
+
+crypto_segment = {
+  "@SEGMENT.CRYPTO" ~
+  password_assignment? ~
+  cipher_assignment ~
+  encryption_directives*
+}
+
+boolean = {"true" | "false"}
+
+separate_length_field_setting = {
+  "SEPARATE_LENGTH_FIELD" ~ "=" ~ boolean ~ ";"
+}
+
+options_segment = {
+  "@SEGMENT.OPTIONS" ~
+  separate_length_field_setting?
+}

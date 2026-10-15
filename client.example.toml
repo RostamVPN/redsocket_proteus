@@ -1,0 +1,14 @@
+server = "127.0.0.1:80"
+pubkey = "e644c8a4dbc44c56b2e2a1f2587a785fc5813aba74674e151455d51cf86dc405"
+
+listen = 1080
+
+host = "example.com"
+
+mux = false
+max_streams = 256
+
+[meta]
+app = "rostam"
+
+sni = ""

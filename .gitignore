@@ -1,0 +1,11 @@
+/target
+/release/*.tar.gz
+*.pyc
+__pycache__/
+release/redsocket-http-x86_64
+
+!**/vendor/**
+!**/vendor/**/target/
+!**/vendor/**/.cargo/
+!**/.cargo/
+!**/local-maven/**

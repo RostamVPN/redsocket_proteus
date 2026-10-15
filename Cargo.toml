@@ -1,0 +1,72 @@
+[package]
+name = "redsocket-http"
+version = "3.4.0"
+edition = "2021"
+rust-version = "1.87"
+license = "Apache-2.0"
+description = "RedSocket HTTP-Upgrade standalone — Noise NK tunnel on port 80, optionally behind a Proteus programmable protocol"
+
+[workspace]
+members = ["tests/harness"]
+default-members = [".", "tests/harness"]
+exclude = ["third_party/proteus"]
+
+[dependencies]
+snow = "0.9"
+
+tokio = { version = "1", features = ["full"] }
+
+rand = "0.8"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+base64 = "0.22"
+hex = "0.4"
+sha1 = "0.10"
+sha2 = "0.10"
+memchr = "2"
+
+socket2 = { version = "0.5", features = ["all"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+clap = { version = "4", features = ["derive"] }
+
+log = "0.4"
+env_logger = "0.11"
+
+anyhow = "1"
+
+once_cell = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+mimalloc = { version = "0.1", default-features = false }
+
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+tokio-rustls = { version = "0.26", default-features = false }
+
+yamux = "0.13"
+futures = "0.3"
+tokio-util = { version = "0.7", features = ["compat", "codec"] }
+
+libc = "0.2"
+ring = "0.17"
+flate2 = "1"
+idna = "1"
+hickory-resolver = "0.26.1"
+proteus = { path = "third_party/proteus" }
+
+[dev-dependencies]
+e2e-harness = { path = "tests/harness" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.6.4"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
