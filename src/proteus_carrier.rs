@@ -1,34 +1,38 @@
 // Copyright 2026 Internet Mastering & Company, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Proteus carrier — the HTTP Upgrade tunnel behind a programmable wire protocol.
+//! Proteus carrier — the only way into the server.
 //!
-//! Each accepted socket is driven by a Proteus interpreter compiled from a PSF;
-//! the interpreter's application side is an in-memory duplex that `http::serve_stream`
-//! treats exactly like a client socket. A dedicated `[proteus]` listener wraps every
-//! connection; the same-port mode (`[http] proteus_psf(s)`) peeks the first bytes of
-//! a connection on the HTTP listener and wraps only those that are not HTTP.
+//! Every accepted socket is driven by a Proteus interpreter compiled from the
+//! PSF its first bytes select; the interpreter's application side is an
+//! in-memory duplex on which the Noise NK handshake starts at once. Nothing is
+//! ever answered in clear.
 
-use std::sync::{Arc, OnceLock};
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use proteus::lang::compiler::parser::parse_psf;
-use proteus::lang::compiler::{Compiler, TaskGraphImpl};
+use proteus::lang::compiler::Compiler;
+pub use proteus::lang::compiler::TaskGraphImpl;
 use proteus::lang::interpreter::Interpreter;
 use proteus::lang::ir::bridge::OldCompile;
 use proteus::lang::types::FieldSemantic;
-use proteus::lang::Role;
-use tokio::net::TcpStream;
+pub use proteus::lang::Role;
+use tokio::io::DuplexStream;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinHandle;
 
-use crate::http;
+use crate::noise_proxy;
+use crate::proxy_protocol::{self, PpMode};
 
-/// Capacity of the duplex between the interpreter and the HTTP handler.
+/// Capacity of the duplex between the interpreter and the tunnel.
 const DUPLEX_CAP: usize = 64 * 1024;
-/// Same per-connection budget as the TCP path.
+/// Per-connection budget.
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(600);
 /// How long the interpreter may take to flush and unwind after the tunnel ends.
 const UNWIND_GRACE: Duration = Duration::from_secs(30);
-/// Same-port classification shares the HTTP header deadline.
+/// How long a connection has to send bytes that select a PSF.
 const PEEK_DEADLINE: Duration = Duration::from_secs(5);
 /// Interval between peeks while the first bytes are still ambiguous.
 const PEEK_POLL: Duration = Duration::from_millis(20);
@@ -57,18 +61,6 @@ pub fn compile_text(psf_path: &str, text: &str, role: Role) -> anyhow::Result<Ta
     guarded(psf_path, || Compiler::parse_content(text, role))
 }
 
-/// Compile a PSF file for `role`, with the path in the error message.
-pub fn compile_psf(psf_path: &str, role: Role) -> anyhow::Result<TaskGraphImpl> {
-    let text = std::fs::read_to_string(psf_path)
-        .map_err(|e| anyhow::anyhow!("[PROTEUS] cannot read PSF {psf_path}: {e}"))?;
-    compile_text(psf_path, &text, role)
-}
-
-/// Fail fast at start-up if the server-side PSF does not compile.
-pub fn check_psf(psf_path: &str) -> anyhow::Result<()> {
-    compile_psf(psf_path, Role::Server).map(|_| ())
-}
-
 /// The bytes a client of this PSF sends first, when its first message opens
 /// with a fixed field; `None` when the first client bytes are not predictable.
 pub fn fixed_prefix(psf_path: &str, text: &str) -> anyhow::Result<Option<Vec<u8>>> {
@@ -89,93 +81,23 @@ pub fn fixed_prefix(psf_path: &str, text: &str) -> anyhow::Result<Option<Vec<u8>
     })
 }
 
-/// Where the first bytes of a same-port connection send it.
+/// Where the first bytes of a connection send it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
-    /// An HTTP request line: a RedSocket client, or a browser owed the 404 decoy.
-    Http,
     /// The PSF at this index of the table.
     Proteus(usize),
-    /// Neither HTTP nor claimed by any PSF.
+    /// Claimed by no PSF, or nothing was sent.
     Close,
     /// Still ambiguous; peek again once more bytes arrive.
     NeedMore,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HttpVerdict {
-    Yes,
-    Prefix,
-    No,
-}
-
-const METHODS: [&[u8]; 6] = [b"GET", b"POST", b"PUT", b"HEAD", b"OPTIONS", b"CONNECT"];
-
-fn visible_ascii(bytes: &[u8]) -> bool {
-    bytes.iter().all(|b| (0x21..=0x7e).contains(b))
-}
-
-/// Does `bytes` start with (or could it grow into) `METHOD /path HTTP/1.`?
-fn http_verdict(bytes: &[u8]) -> HttpVerdict {
-    let mut could_extend = false;
-    let mut method_len = None;
-    for m in METHODS {
-        if bytes.len() >= m.len() {
-            if bytes.starts_with(m) {
-                method_len = Some(m.len());
-                break;
-            }
-        } else if m.starts_with(bytes) {
-            could_extend = true;
-        }
-    }
-    let Some(method_len) = method_len else {
-        return if could_extend {
-            HttpVerdict::Prefix
-        } else {
-            HttpVerdict::No
-        };
-    };
-    let rest = &bytes[method_len..];
-    for (i, want) in b" /".iter().enumerate() {
-        match rest.get(i) {
-            None => return HttpVerdict::Prefix,
-            Some(b) if b == want => {}
-            Some(_) => return HttpVerdict::No,
-        }
-    }
-    let rest = &rest[2..];
-    let Some(space) = rest.iter().position(|&b| b == b' ') else {
-        return if visible_ascii(rest) {
-            HttpVerdict::Prefix
-        } else {
-            HttpVerdict::No
-        };
-    };
-    if !visible_ascii(&rest[..space]) {
-        return HttpVerdict::No;
-    }
-    let version = &rest[space + 1..];
-    let want: &[u8] = b"HTTP/1.";
-    if version.len() >= want.len() {
-        if version.starts_with(want) {
-            HttpVerdict::Yes
-        } else {
-            HttpVerdict::No
-        }
-    } else if want.starts_with(version) {
-        HttpVerdict::Prefix
-    } else {
-        HttpVerdict::No
-    }
-}
-
-/// Fixed-prefix dispatch table for the same-port mode.
+/// Fixed-prefix dispatch table.
 #[derive(Debug, Clone, Default)]
 pub struct Table {
     /// `(prefix, index)`, longest prefix first.
     prefixes: Vec<(Vec<u8>, usize)>,
-    /// The PSF for non-HTTP bytes no prefix claims.
+    /// The PSF for bytes no prefix claims.
     default: Option<usize>,
 }
 
@@ -194,23 +116,22 @@ impl Table {
 
     /// Classify bytes more of which may still arrive.
     pub fn route(&self, bytes: &[u8]) -> Route {
-        match http_verdict(bytes) {
-            HttpVerdict::Yes => Route::Http,
-            HttpVerdict::Prefix => Route::NeedMore,
-            HttpVerdict::No => self.route_proteus(bytes, false),
+        if bytes.is_empty() {
+            return Route::NeedMore;
         }
+        self.classify(bytes, false)
     }
 
-    /// Classify when no more bytes will come: an HTTP-looking start goes to the
-    /// HTTP handler for its usual 400, a pending prefix no longer counts.
+    /// Classify when no more bytes will come: a pending prefix no longer counts
+    /// and a peer that sent nothing is closed.
     pub fn route_final(&self, bytes: &[u8]) -> Route {
-        match http_verdict(bytes) {
-            HttpVerdict::Yes | HttpVerdict::Prefix => Route::Http,
-            HttpVerdict::No => self.route_proteus(bytes, true),
+        if bytes.is_empty() {
+            return Route::Close;
         }
+        self.classify(bytes, true)
     }
 
-    fn route_proteus(&self, bytes: &[u8], is_final: bool) -> Route {
+    fn classify(&self, bytes: &[u8], is_final: bool) -> Route {
         let mut pending = false;
         let mut matched = None;
         for (prefix, idx) in &self.prefixes {
@@ -232,7 +153,7 @@ impl Table {
     }
 }
 
-/// The compiled PSFs sharing the HTTP listener, with their dispatch table.
+/// The compiled PSFs of a listener, with their dispatch table.
 pub struct Dispatch {
     names: Vec<String>,
     protos: Vec<TaskGraphImpl>,
@@ -265,7 +186,7 @@ impl Dispatch {
                     None => default = Some(i),
                     Some(d) => anyhow::bail!(
                         "[PROTEUS] {} and {} both start with unpredictable client bytes; \
-                         only one PSF on a shared port may lack a fixed first message",
+                         only one PSF on a port may lack a fixed first message",
                         sources[d].0,
                         name
                     ),
@@ -300,15 +221,29 @@ impl Dispatch {
     }
 }
 
-static SAME_PORT: OnceLock<Dispatch> = OnceLock::new();
-
-/// Install the same-port dispatch for every HTTP listener.
-pub fn set_same_port(dispatch: Dispatch) {
-    let _ = SAME_PORT.set(dispatch);
-}
-
-pub fn same_port() -> Option<&'static Dispatch> {
-    SAME_PORT.get()
+/// Bind with SO_REUSEADDR (restart over TIME_WAIT) and SO_REUSEPORT (N daemons
+/// on one port, zero-downtime restarts).
+async fn bind_listener(bind_addr: &str) -> anyhow::Result<TcpListener> {
+    let addr: SocketAddr = bind_addr
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid bind address {bind_addr}: {e}"))?;
+    let domain = if addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let sock = socket2::Socket::new(domain, socket2::Type::STREAM, None)?;
+    sock.set_nonblocking(true)?;
+    sock.set_reuse_address(true)?;
+    if let Err(e) = sock.set_reuse_port(true) {
+        log::warn!(
+            "[PROTEUS] SO_REUSEPORT unsupported on this platform: {} (continuing)",
+            e
+        );
+    }
+    sock.bind(&addr.into())?;
+    sock.listen(4096)?;
+    TcpListener::from_std(sock.into()).map_err(Into::into)
 }
 
 /// Peek (never consume) the first bytes until they classify or the deadline passes.
@@ -341,51 +276,27 @@ async fn peek_route(stream: &TcpStream, table: &Table) -> std::io::Result<Route>
     }
 }
 
-/// Serve a connection from the HTTP listener in same-port mode.
-pub async fn serve_same_port(
-    stream: TcpStream,
-    peer: std::net::SocketAddr,
-    keys: Arc<Vec<[u8; 32]>>,
-    egress: Arc<[String]>,
-    dispatch: &Dispatch,
-) {
-    let route = match peek_route(&stream, &dispatch.table).await {
-        Ok(r) => r,
-        Err(e) => {
-            log::debug!("[PROTEUS] peek from {} failed: {}", peer, e);
-            return;
-        }
-    };
-    match route {
-        Route::Http => http::serve_tcp(stream, peer, keys, egress).await,
-        Route::Proteus(i) => {
-            log::debug!("[PROTEUS] {} -> {}", peer, dispatch.names[i]);
-            serve(stream, peer, keys, egress, dispatch.protos[i].clone()).await;
-        }
-        Route::Close | Route::NeedMore => {
-            log::debug!(
-                "[PROTEUS] {} is neither HTTP nor a known PSF, closing",
-                peer
-            );
-        }
-    }
-}
-
-/// Listen on `bind` and serve every connection through the interpreter.
+/// Listen on `bind` and serve every connection through the PSF its first
+/// bytes select. Under memory shedding a socket is dropped before any peek or
+/// buffer; a PROXY header, if enabled, is read before the first bytes are peeked.
 pub async fn run(
     bind: &str,
-    psf_path: &str,
+    dispatch: Arc<Dispatch>,
     server_keys: Arc<Vec<[u8; 32]>>,
+    pp_mode: PpMode,
     egress_ips: Arc<[String]>,
     socket_sndbuf: usize,
     socket_rcvbuf: usize,
 ) -> anyhow::Result<()> {
-    let proto = compile_psf(psf_path, Role::Server)?;
-    let listener = http::bind_listener(bind).await?;
-    log::info!("[PROTEUS] Listening on {} (psf={})", bind, psf_path);
+    let listener = bind_listener(bind).await?;
+    log::info!(
+        "[PROTEUS] Listening on {} (proxy_protocol={:?})",
+        bind,
+        pp_mode
+    );
 
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, edge_peer) = listener.accept().await?;
         let _ = stream.set_nodelay(true);
 
         {
@@ -402,48 +313,79 @@ pub async fn run(
             let _ = sock.set_tcp_keepalive(&ka);
         }
 
+        let dispatch = dispatch.clone();
         let keys = server_keys.clone();
         let egress = egress_ips.clone();
-        let proto = proto.clone();
         tokio::spawn(async move {
-            serve(stream, peer, keys, egress, proto).await;
+            if crate::shed::is_shedding() {
+                crate::shed::note_refused();
+                log::debug!("[SHED] refusing connection from {} — memory", edge_peer);
+                return;
+            }
+            let mut stream = stream;
+            let peer = match proxy_protocol::peek_and_strip(&mut stream, edge_peer, pp_mode).await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    log::debug!("[PROTEUS] PROXY parse from {}: {}", edge_peer, e);
+                    return;
+                }
+            };
+            match peek_route(&stream, &dispatch.table).await {
+                Ok(Route::Proteus(i)) => {
+                    log::debug!("[PROTEUS] {} -> {}", peer, dispatch.names[i]);
+                    serve(stream, peer, keys, egress, dispatch.protos[i].clone()).await;
+                }
+                Ok(Route::Close | Route::NeedMore) => {
+                    log::debug!("[PROTEUS] {} opened with no known PSF's bytes, closing", peer);
+                }
+                Err(e) => log::debug!("[PROTEUS] peek from {} failed: {}", peer, e),
+            }
         });
     }
 }
 
-/// Run one connection: interpreter on the socket, HTTP handler on the duplex.
-/// Under memory shedding the socket is dropped before any buffer is allocated.
-pub async fn serve(
+/// Put `proto` between `tcp` and the returned application-side stream. The
+/// handle is the interpreter task; `peer` only names it in the log.
+pub fn wrap(
     tcp: TcpStream,
-    peer: std::net::SocketAddr,
-    keys: Arc<Vec<[u8; 32]>>,
-    egress: Arc<[String]>,
+    peer: SocketAddr,
     proto: TaskGraphImpl,
-) {
-    if crate::shed::is_shedding() {
-        crate::shed::note_refused();
-        log::debug!("[SHED] refusing proteus connection from {} — memory", peer);
-        return;
-    }
-
+) -> (DuplexStream, JoinHandle<()>) {
     let (app_side, interp_side) = tokio::io::duplex(DUPLEX_CAP);
     let (net_r, net_w) = tcp.into_split();
     let (int_r, int_w) = tokio::io::split(interp_side);
-
-    let mut interp = tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let mut interp = Interpreter::new(int_r, int_w, net_r, net_w, proto);
         if let Err(e) = interp.run_try_join().await {
             log::debug!("[PROTEUS] interpreter for {} ended: {}", peer, e);
         }
     });
+    (app_side, task)
+}
+
+/// Run one connection: interpreter on the socket, Noise tunnel on the duplex.
+async fn serve(
+    tcp: TcpStream,
+    peer: SocketAddr,
+    keys: Arc<Vec<[u8; 32]>>,
+    egress: Arc<[String]>,
+    proto: TaskGraphImpl,
+) {
+    let (app_side, mut interp) = wrap(tcp, peer, proto);
+    let real_ip = peer.ip().to_string();
+    let capture = crate::stats::enabled().then(|| crate::stats::Capture::new(&real_ip, ""));
 
     match tokio::time::timeout(
         CONNECTION_TIMEOUT,
-        http::serve_stream(app_side, peer, keys, egress, None),
+        noise_proxy::run_streaming_tunnel(app_side, &keys, &real_ip, egress, capture),
     )
     .await
     {
-        Ok(Err(e)) => log::debug!("[PROTEUS] Connection error from {}: {}", peer, e),
+        Ok(Err(e)) => {
+            log::debug!("[PROTEUS] {} tunnel error: {}", real_ip, e);
+            crate::metrics::inc_hs_fail();
+        }
         Err(_) => log::debug!("[PROTEUS] Connection timeout (600s) from {}", peer),
         _ => {}
     }
@@ -471,50 +413,6 @@ mod tests {
             .expect("tls_mimic opens with FIXED_BYTES")
     }
 
-    #[test]
-    fn an_http_request_line_is_http_and_a_partial_one_needs_more() {
-        for line in [
-            &b"GET /noise HTTP/1.1\r\nHost: x\r\n\r\n"[..],
-            b"GET / HTTP/1.0\r\n",
-            b"POST /?cid=abc HTTP/1.1",
-            b"CONNECT /x HTTP/1.",
-            b"OPTIONS /x HTTP/1.1\r\n",
-        ] {
-            assert_eq!(http_verdict(line), HttpVerdict::Yes, "{line:?}");
-        }
-        for partial in [
-            &b""[..],
-            b"G",
-            b"GET",
-            b"GET ",
-            b"GET /",
-            b"GET /noise",
-            b"GET /noise HTTP/1",
-        ] {
-            assert_eq!(http_verdict(partial), HttpVerdict::Prefix, "{partial:?}");
-        }
-    }
-
-    #[test]
-    fn tls_random_and_malformed_bytes_are_not_http() {
-        let random = [
-            0x9f, 0x41, 0x00, 0xe3, 0x7a, 0x2c, 0x55, 0x10, 0xff, 0x83, 0x6d, 0x1b,
-        ];
-        for bytes in [
-            &client_hello()[..],
-            &[0x16, 0x03, 0x01, 0x00, 0xa1],
-            &random,
-            b"FOO / HTTP/1.1\r\n",
-            b"GET x HTTP/1.1\r\n",
-            b"GET / HTTP/2\r\n",
-            b"GET /\x00 HTTP/1.1",
-            b"GETX / HTTP/1.1",
-            b"get / HTTP/1.1",
-        ] {
-            assert_eq!(http_verdict(bytes), HttpVerdict::No, "{bytes:?}");
-        }
-    }
-
     fn table() -> Table {
         Table::new(
             vec![
@@ -523,6 +421,14 @@ mod tests {
             ],
             Some(2),
         )
+    }
+
+    fn both() -> Dispatch {
+        Dispatch::from_sources(&[
+            ("tls_mimic.psf".to_string(), TLS_MIMIC.to_string()),
+            ("shadowsocks.psf".to_string(), SHADOWSOCKS.to_string()),
+        ])
+        .unwrap()
     }
 
     #[test]
@@ -555,42 +461,49 @@ mod tests {
         let no_default = Table::new(vec![(vec![0x16, 0x03, 0x01], 0)], None);
         assert_eq!(no_default.route(&random), Route::Close);
         assert_eq!(no_default.route_final(&[0x16]), Route::Close);
-        assert_eq!(
-            no_default.route_final(&[]),
-            Route::Http,
-            "a silent peer gets the HTTP handler's 400"
-        );
     }
 
     #[test]
-    fn http_wins_over_every_prefix_and_a_partial_line_waits() {
-        let t = table();
-        assert_eq!(t.route(b"GET /noise HTTP/1.1\r\n"), Route::Http);
-        assert_eq!(t.route(b"GET /no"), Route::NeedMore);
-        assert_eq!(t.route_final(b"GET /no"), Route::Http);
+    fn a_silent_peer_is_closed_whatever_the_table() {
+        assert_eq!(table().route(&[]), Route::NeedMore);
+        assert_eq!(table().route_final(&[]), Route::Close, "even with a default");
+        assert_eq!(Table::new(Vec::new(), Some(0)).route_final(&[]), Route::Close);
+    }
+
+    /// Nothing answers HTTP: a request line is bytes like any other, taken by
+    /// the default PSF or closed.
+    #[test]
+    fn an_http_request_line_is_claimed_by_no_psf() {
+        let d = both();
+        for line in [
+            &b"GET /noise HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\r\n"[..],
+            b"GET / HTTP/1.1\r\n\r\n",
+            b"POST /?cid=abc HTTP/1.1",
+        ] {
+            assert_eq!(d.table().route(line), Route::Proteus(1), "{line:?}");
+        }
+        let only_tls =
+            Dispatch::from_sources(&[("tls_mimic.psf".to_string(), TLS_MIMIC.to_string())])
+                .unwrap();
         assert_eq!(
-            t.route(b"GET / HTTP/1.1\r\n\r\n"),
-            Route::Http,
-            "non-upgrade requests still reach the 404 decoy"
+            only_tls.table().route(b"GET /noise HTTP/1.1\r\n"),
+            Route::Close
         );
+        assert_eq!(only_tls.table().route(b"G"), Route::Close);
     }
 
     #[test]
     fn tls_mimic_dispatches_by_its_client_hello_and_shadowsocks_is_the_default() {
-        let d = Dispatch::from_sources(&[
-            ("tls_mimic.psf".to_string(), TLS_MIMIC.to_string()),
-            ("shadowsocks.psf".to_string(), SHADOWSOCKS.to_string()),
-        ])
-        .unwrap();
+        let d = both();
         let hello = client_hello();
         assert_eq!(hello.len(), 166);
         assert_eq!(d.table().route(&hello), Route::Proteus(0));
         assert_eq!(d.table().route(&hello[..100]), Route::NeedMore);
+        assert_eq!(d.table().route_final(&hello[..100]), Route::Proteus(1));
         assert_eq!(
             d.table().route(&[0x00, 0x2a, 0x11, 0x22]),
             Route::Proteus(1)
         );
-        assert_eq!(d.table().route(b"GET / HTTP/1.1\r\n"), Route::Http);
         assert_eq!(d.table().peek_len(), PEEK_MIN);
         assert_eq!(
             d.describe(),

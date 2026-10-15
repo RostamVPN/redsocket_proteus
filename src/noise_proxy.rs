@@ -1,7 +1,7 @@
 // Copyright 2026 Internet Mastering & Company, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Noise Proxy — streaming Noise NK tunnel over HTTP Upgrade.
+//! Noise Proxy — streaming Noise NK tunnel on the carrier's plaintext side.
 
 use crate::noise::NoiseHandshake;
 
@@ -27,25 +27,18 @@ pub fn initial_buf(cap: usize) -> usize {
     }
 }
 
-/// Same as `run_streaming_tunnel` but consumes `prefix` bytes (already read
-/// past the HTTP headers by the parser) as the start of the Noise stream.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_streaming_tunnel_with_prefix<S>(
-    stream: S,
-    prefix: Vec<u8>,
+/// Serve one tunnel from its first byte: the Noise NK handshake, then META /
+/// MUX2 / CONNECT. `real_ip` is the socket peer or the PROXY-protocol source.
+pub async fn run_streaming_tunnel<S>(
+    mut stream: S,
     server_keys: &[[u8; 32]],
     real_ip: &str,
-    user_agent: &str,
     egress_ips: std::sync::Arc<[String]>,
-    url_cid: &str,
     mut capture: Option<crate::stats::Capture>,
-    client_raw_fd: Option<std::os::unix::io::RawFd>,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let mut stream = PrependReader::new(stream, prefix);
-
     let server_pubkey_hex = server_keys
         .first()
         .map(|k| hex::encode(crate::noise::pubkey_from_private(k)))
@@ -66,11 +59,7 @@ where
     stream.flush().await?;
 
     crate::metrics::inc_hs_ok();
-    log::debug!(
-        "[NoiseProxy] Handshake complete from ip={} ua=\"{}\"",
-        real_ip,
-        user_agent
-    );
+    log::debug!("[NoiseProxy] Handshake complete from ip={}", real_ip);
 
     let first_ct_len = read_u16_be(&mut stream).await?;
     let mut first_ct = vec![0u8; first_ct_len as usize];
@@ -109,18 +98,17 @@ where
             }
 
             log::debug!(
-                "[NoiseProxy] Client meta: tz={} app={} os={} cid={} sni={} ip={} ua=\"{}\"",
+                "[NoiseProxy] Client meta: tz={} app={} os={} cid={} sni={} ip={}",
                 tz,
                 app,
                 os,
                 cid,
                 sni,
-                real_ip,
-                user_agent
+                real_ip
             );
             log::debug!(
-                "metric=tunnel.opened cid=\"{}\" brand=\"{}\" tz=\"{}\" os=\"{}\" sni=\"{}\" ip=\"{}\" ua=\"{}\"",
-                cid, app, tz, os, sni, real_ip, user_agent
+                "metric=tunnel.opened cid=\"{}\" brand=\"{}\" tz=\"{}\" os=\"{}\" sni=\"{}\" ip=\"{}\"",
+                cid, app, tz, os, sni, real_ip
             );
 
             client_tz = tz.to_string();
@@ -153,20 +141,12 @@ where
         }
         second_pt
     } else {
-        log::debug!(
-            "[NoiseProxy] Legacy client (no META) ip={} ua=\"{}\"",
-            real_ip,
-            user_agent
-        );
+        log::debug!("[NoiseProxy] Legacy client (no META) ip={}", real_ip);
         if let Some(c) = capture.take() {
             c.emit("", "", "", "", "");
         }
         first_pt
     };
-
-    if client_cid.is_none() && !url_cid.is_empty() {
-        client_cid = Some(url_cid.to_string());
-    }
 
     let (host, port) = crate::proxy::parse_connect_request(&connect_pt)?;
 
@@ -207,46 +187,6 @@ where
             .with_time(std::time::Duration::from_secs(60))
             .with_interval(std::time::Duration::from_secs(15));
         let _ = sock.set_tcp_keepalive(&keepalive);
-    }
-
-    if crate::iouring_relay::enabled() {
-        if let Some(client_fd) = client_raw_fd {
-            use std::os::unix::io::AsRawFd;
-
-            let dup_client = unsafe { libc::dup(client_fd) };
-            let dup_target = unsafe { libc::dup(target.as_raw_fd()) };
-            if dup_client >= 0 && dup_target >= 0 {
-                for fd in [dup_client, dup_target] {
-                    unsafe {
-                        let fl = libc::fcntl(fd, libc::F_GETFL);
-                        libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
-                    }
-                }
-                let session = noise_session.into_transport_state();
-                let job = crate::iouring_relay::RelayJob {
-                    fd_a: dup_client,
-                    fd_b: dup_target,
-                    session,
-                    ws_prefix: Vec::new(),
-                    websocket: false,
-                };
-                match crate::iouring_relay::submit(job) {
-                    Ok(()) => {
-                        drop(stream);
-                        drop(target);
-                        log::debug!("[NoiseProxy] {} handed to io_uring reactor", real_ip);
-                        return Ok(());
-                    }
-                    Err(_) => {
-                        unsafe {
-                            libc::close(dup_client);
-                            libc::close(dup_target);
-                        }
-                        return Ok(());
-                    }
-                }
-            }
-        }
     }
 
     let session = std::sync::Arc::new(std::sync::Mutex::new(noise_session));
@@ -347,14 +287,13 @@ where
         0
     };
     log::debug!(
-        "metric=tunnel.closed id={id} cid=\"{cid}\" carrier=\"http\" \
+        "metric=tunnel.closed id={id} cid=\"{cid}\" carrier=\"proteus\" \
          dest=\"{host}:{port}\" tz=\"{tz}\" age_ms={age_ms} \
-         bytes_up={bytes_up} bytes_down={bytes_down} avg_kbps={kbps} ua=\"{ua}\"",
+         bytes_up={bytes_up} bytes_down={bytes_down} avg_kbps={kbps}",
         id = tunnel_id,
         cid = client_cid.as_deref().unwrap_or(""),
         tz = client_tz,
         age_ms = age.as_millis() as u64,
-        ua = user_agent,
     );
     drop(tunnel);
 
@@ -370,59 +309,4 @@ async fn read_u16_be<S: AsyncReadExt + Unpin>(stream: &mut S) -> anyhow::Result<
 async fn write_u16_be<S: AsyncWriteExt + Unpin>(stream: &mut S, val: u16) -> anyhow::Result<()> {
     stream.write_all(&val.to_be_bytes()).await?;
     Ok(())
-}
-
-/// Wrapper around a byte stream that first yields `prefix` bytes, then falls
-/// through to the underlying stream. Used when the HTTP parser consumed bytes
-/// past `\r\n\r\n` that already belong to the Noise stream.
-pub struct PrependReader<S> {
-    inner: S,
-    prefix: std::collections::VecDeque<u8>,
-}
-
-impl<S> PrependReader<S> {
-    pub fn new(inner: S, prefix: Vec<u8>) -> Self {
-        Self {
-            inner,
-            prefix: prefix.into(),
-        }
-    }
-}
-
-impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for PrependReader<S> {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        if !self.prefix.is_empty() {
-            let n = buf.remaining().min(self.prefix.len());
-            let drained: Vec<u8> = self.prefix.drain(..n).collect();
-            buf.put_slice(&drained);
-            return std::task::Poll::Ready(Ok(()));
-        }
-        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
-    }
-}
-
-impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for PrependReader<S> {
-    fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        data: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        std::pin::Pin::new(&mut self.inner).poll_write(cx, data)
-    }
-    fn poll_flush(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
-    }
-    fn poll_shutdown(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
 }

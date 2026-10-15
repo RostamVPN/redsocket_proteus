@@ -1,11 +1,11 @@
 // Copyright 2026 Internet Mastering & Company, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! RedSocket HTTP-Standalone — Noise NK tunnel on port 80.
+//! RedSocket behind Proteus — the Noise NK tunnel, reachable only through a PSF.
 
 use redsocket_http::{
-    config, stats, http, iouring_relay, messaging, metrics, noise, noise_proxy,
-    protection, proteus_carrier, proxy, shed,
+    config, messaging, metrics, noise, noise_proxy, protection, proteus_carrier, proxy, shed,
+    stats,
 };
 
 use clap::Parser;
@@ -24,13 +24,13 @@ const VERSION: &str = concat!(
 );
 
 #[derive(Parser)]
-#[command(name = "redsocket-http", version = VERSION, about = "RedSocket HTTP-Upgrade standalone tunnel")]
+#[command(name = "redsocket-http", version = VERSION, about = "RedSocket tunnel behind a Proteus carrier")]
 struct Cli {
     /// Path to config file.
     #[arg(long, default_value = "/etc/redsocket/config.toml")]
     config: String,
 
-    /// Override bind address (e.g., "0.0.0.0:80").
+    /// Override the Proteus listen address (e.g., "0.0.0.0:443").
     #[arg(long)]
     bind: Option<String>,
 
@@ -63,11 +63,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let config = config::Config::load(&cli.config)?;
-    http::set_allowed_upgrade_hosts(config.http.allowed_upgrade_hosts.clone());
 
     let private_key_hex = cli.private_key.as_deref().unwrap_or(&config.private_key);
     let public_key_hex = cli.public_key.as_deref().unwrap_or(&config.public_key);
-    let bind_addr = cli.bind.as_deref().unwrap_or(&config.http.bind);
+    let bind_addr = cli.bind.as_deref().unwrap_or(&config.proteus.bind);
 
     if private_key_hex.len() != 64 {
         anyhow::bail!("private_key must be 64 hex chars");
@@ -118,9 +117,12 @@ async fn main() -> anyhow::Result<()> {
         derived_pub_hex
     };
 
-    log::info!("═══ RedSocket HTTP-Standalone v{} ═══", VERSION);
+    let dispatch = std::sync::Arc::new(proteus_carrier::Dispatch::load(&config.proteus.psfs)?);
+
+    log::info!("═══ RedSocket Proteus v{} ═══", VERSION);
     log::info!("  bind:           {}", bind_addr);
-    log::info!("  proxy_protocol: {:?}", config.http.proxy_protocol);
+    log::info!("  proteus psfs:   {}", dispatch.describe());
+    log::info!("  proxy_protocol: {:?}", config.proteus.proxy_protocol);
     log::info!("  pubkey:         {}", pubkey_hex);
     let (metrics_bind_eff, metrics_clamped) = config.metrics.effective_bind();
     if metrics_clamped {
@@ -178,8 +180,8 @@ async fn main() -> anyhow::Result<()> {
     }
     log::info!(
         "  socket bufs:    snd={} rcv={} (0=autotune)",
-        config.http.socket_sndbuf,
-        config.http.socket_rcvbuf
+        config.proteus.socket_sndbuf,
+        config.proteus.socket_rcvbuf
     );
     if config.shed.enabled {
         shed::spawn(
@@ -188,9 +190,9 @@ async fn main() -> anyhow::Result<()> {
             std::time::Duration::from_secs(config.shed.interval_secs.max(1)),
         );
         log::info!(
-            "[SHED] refusing new tunnels above {}% of the memory limit, resuming below {}% \
-             (sampled every {}s). Clients see a 503 and rotate to another node; established \
-             tunnels are never touched.",
+            "[SHED] closing new connections above {}% of the memory limit, accepting again below \
+             {}% (sampled every {}s). Clients rotate to another node; established tunnels are \
+             never touched.",
             config.shed.high_pct,
             config.shed.low_pct,
             config.shed.interval_secs.max(1)
@@ -246,65 +248,29 @@ async fn main() -> anyhow::Result<()> {
         config.relay.initial_buffer
     );
 
-    if config.relay.use_iouring() {
-        let reactors = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
-        iouring_relay::init(reactors);
-        log::info!(
-            "  io_backend:     iouring (engine_up={})",
-            iouring_relay::enabled()
-        );
-    } else {
-        log::info!("  io_backend:     epoll");
-    }
-
-    let same_port = config.http.same_port_psfs();
-    if !same_port.is_empty() {
-        let dispatch = proteus_carrier::Dispatch::load(&same_port)?;
-        log::info!("  proteus shared: {}", dispatch.describe());
-        proteus_carrier::set_same_port(dispatch);
-    }
-
-    if let Some(pc) = &config.proteus {
-        proteus_carrier::check_psf(&pc.psf)?;
-        for bind in std::iter::once(&pc.bind).chain(pc.extra_binds.iter()) {
-            let bind = bind.clone();
-            let psf = pc.psf.clone();
-            let eg = egress.clone();
-            let keys = server_keys.clone();
-            let snd = config.http.socket_sndbuf;
-            let rcv = config.http.socket_rcvbuf;
-            log::info!("  proteus:        {} psf={}", bind, psf);
-            tokio::spawn(async move {
-                if let Err(e) = proteus_carrier::run(&bind, &psf, keys, eg, snd, rcv).await {
-                    log::error!("[PROTEUS] bind {} failed: {}", bind, e);
-                }
-            });
-        }
-    }
-
-    for extra in &config.http.extra_binds {
+    for extra in &config.proteus.extra_binds {
         let extra = extra.clone();
-        let pp = config.http.proxy_protocol;
-        let eg = egress.clone();
+        let dispatch = dispatch.clone();
         let keys = server_keys.clone();
-        let snd = config.http.socket_sndbuf;
-        let rcv = config.http.socket_rcvbuf;
+        let pp = config.proteus.proxy_protocol;
+        let eg = egress.clone();
+        let snd = config.proteus.socket_sndbuf;
+        let rcv = config.proteus.socket_rcvbuf;
         log::info!("  extra bind:     {}", extra);
         tokio::spawn(async move {
-            if let Err(e) = http::run(&extra, keys, pp, eg, snd, rcv).await {
-                log::error!("[HTTP] extra bind {} failed: {}", extra, e);
+            if let Err(e) = proteus_carrier::run(&extra, dispatch, keys, pp, eg, snd, rcv).await {
+                log::error!("[PROTEUS] extra bind {} failed: {}", extra, e);
             }
         });
     }
-    http::run(
+    proteus_carrier::run(
         bind_addr,
+        dispatch,
         server_keys,
-        config.http.proxy_protocol,
+        config.proteus.proxy_protocol,
         egress,
-        config.http.socket_sndbuf,
-        config.http.socket_rcvbuf,
+        config.proteus.socket_sndbuf,
+        config.proteus.socket_rcvbuf,
     )
     .await?;
 
@@ -425,7 +391,7 @@ fn prometheus_text() -> String {
         out.push_str("# HELP redsocket_mem_pct memory used as a percent of the enforced limit\n");
         out.push_str("# TYPE redsocket_mem_pct gauge\n");
         out.push_str(&format!("redsocket_mem_pct {}\n", pct));
-        out.push_str("# HELP redsocket_shed_refused_total new tunnels declined with a 503\n");
+        out.push_str("# HELP redsocket_shed_refused_total new connections closed for memory\n");
         out.push_str("# TYPE redsocket_shed_refused_total counter\n");
         out.push_str(&format!("redsocket_shed_refused_total {}\n", refused));
     }

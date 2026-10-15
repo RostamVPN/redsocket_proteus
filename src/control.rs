@@ -43,7 +43,7 @@ async fn handle_config<S: AsyncWrite + Unpin>(
     server_pubkey_hex: &str,
 ) -> anyhow::Result<()> {
     let body = format!(
-        r#"{{"noise_pubkey":"{}","carriers":["http"],"server":"redsocket-http"}}"#,
+        r#"{{"noise_pubkey":"{}","carriers":["proteus"],"server":"redsocket-http"}}"#,
         server_pubkey_hex
     );
 
@@ -120,7 +120,7 @@ mod tests {
         client.read_exact(&mut body).await.unwrap();
         assert_eq!(
             String::from_utf8(body).unwrap(),
-            r#"{"noise_pubkey":"abcd","carriers":["http"],"server":"redsocket-http"}"#
+            r#"{"noise_pubkey":"abcd","carriers":["proteus"],"server":"redsocket-http"}"#
         );
     }
 

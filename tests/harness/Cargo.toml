@@ -10,7 +10,6 @@ publish = false
 [dependencies]
 redsocket-http = { path = "../.." }
 anyhow = "1"
-hex = "0.4"
 futures = "0.3"
 serde_json = "1"
 snow = "0.9"

@@ -14,8 +14,8 @@ const V1_PREFIX: &[u8] = b"PROXY ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PpMode {
-    Disabled,
     #[default]
+    Disabled,
     Auto,
     Required,
 }
@@ -396,7 +396,17 @@ mod tests {
     }
 
     #[test]
-    fn the_default_mode_is_auto() {
-        assert!(matches!(PpMode::default(), PpMode::Auto));
+    fn the_default_mode_is_disabled() {
+        assert_eq!(PpMode::default(), PpMode::Disabled);
+        assert_eq!(
+            toml::from_str::<crate::config::Config>(
+                "private_key = \"aa\"\npublic_key = \"bb\"\n[proteus]\npsfs = [\"x.psf\"]\n"
+            )
+            .unwrap()
+            .proteus
+            .proxy_protocol,
+            PpMode::Disabled,
+            "a [proteus] section without the key must not trust PROXY headers"
+        );
     }
 }

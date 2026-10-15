@@ -1,7 +1,7 @@
 // Copyright 2026 Internet Mastering & Company, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Configuration — TOML-based config for the HTTP-standalone server.
+//! Configuration — TOML-based config for the Proteus-only server.
 
 use crate::proxy_protocol::PpMode;
 use serde::Deserialize;
@@ -12,8 +12,9 @@ pub struct Config {
     pub public_key: String,
     #[serde(default)]
     pub extra_private_keys: Vec<String>,
+    /// `[proteus]` — the listener. At least one PSF is required.
     #[serde(default)]
-    pub http: HttpConfig,
+    pub proteus: ProteusConfig,
     #[serde(default)]
     pub metrics: MetricsConfig,
     #[serde(default)]
@@ -44,22 +45,49 @@ pub struct Config {
     pub allow_cidrs: Vec<String>,
     #[serde(default)]
     pub valkey: Option<ValkeyConfig>,
-    /// `[proteus]` — a dedicated listener whose wire format is a Proteus protocol
-    /// specification wrapped around the HTTP Upgrade carrier. Absent = none.
-    #[serde(default)]
-    pub proteus: Option<ProteusConfig>,
 }
 
-/// One Proteus-wrapped carrier: the PSF is compiled once at start-up and every
-/// accepted connection runs the interpreter in front of `http::serve_stream`.
+/// `[proteus]` — the only way in: every connection is driven by the PSF its
+/// first bytes select, and the Noise handshake starts on the interpreter's
+/// application side.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProteusConfig {
+    #[serde(default = "default_proteus_bind")]
     pub bind: String,
-    /// Path to the protocol specification file.
-    pub psf: String,
-    /// More listen addresses for the same PSF.
+    /// More listen addresses for the same PSFs.
     #[serde(default)]
     pub extra_binds: Vec<String>,
+    /// Protocol specification files, compiled once at start-up and told apart
+    /// by the fixed bytes their first client message opens with; at most one
+    /// may have none.
+    #[serde(default)]
+    pub psfs: Vec<String>,
+    /// Accepted-socket buffer sizes in bytes; 0 keeps kernel autotuning.
+    #[serde(default)]
+    pub socket_sndbuf: usize,
+    #[serde(default)]
+    pub socket_rcvbuf: usize,
+    /// PROXY protocol v1/v2 ahead of the interpreter, so a load balancer can
+    /// still convey the peer address. Off unless asked for.
+    #[serde(default)]
+    pub proxy_protocol: PpMode,
+}
+
+impl Default for ProteusConfig {
+    fn default() -> Self {
+        Self {
+            bind: default_proteus_bind(),
+            extra_binds: Vec::new(),
+            psfs: Vec::new(),
+            socket_sndbuf: 0,
+            socket_rcvbuf: 0,
+            proxy_protocol: PpMode::Disabled,
+        }
+    }
+}
+
+fn default_proteus_bind() -> String {
+    "0.0.0.0:443".to_string()
 }
 
 /// `[protection]` — the exit-side malware check. Which tunnels are checked is
@@ -151,9 +179,9 @@ pub struct MessagingConfig {
     pub valkey: Option<crate::valkey::Config>,
 }
 
-/// Load shedding: refuse NEW tunnels with a 503 as memory runs out, so clients
-/// fail over to another node instead of every tunnel here dying at once when
-/// the OOM killer arrives.
+/// Load shedding: close NEW connections before an interpreter is allocated as
+/// memory runs out, so clients fail over to another node instead of every
+/// tunnel here dying at once when the OOM killer arrives.
 #[derive(Debug, Deserialize)]
 pub struct ShedConfig {
     /// Off means accept until the process dies, which is the old behaviour.
@@ -223,63 +251,6 @@ pub struct ValkeyConfig {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct HttpConfig {
-    #[serde(default = "default_http_bind")]
-    pub bind: String,
-    #[serde(default)]
-    pub extra_binds: Vec<String>,
-    #[serde(default)]
-    pub proxy_protocol: PpMode,
-    #[serde(default)]
-    pub socket_sndbuf: usize,
-    #[serde(default)]
-    pub socket_rcvbuf: usize,
-    /// Hosts allowed to receive a 101. EMPTY MEANS ALLOW ANY, which is what the
-    /// fleet runs and why this defaults off — but on a dedicated endpoint it is the
-    /// difference between a probe oracle and a 404. See http.rs.
-    #[serde(default)]
-    pub allowed_upgrade_hosts: Vec<String>,
-    /// Same-port Proteus: one PSF whose clients share `bind` and `extra_binds`
-    /// with plain HTTP clients. Absent = every connection is HTTP.
-    #[serde(default)]
-    pub proteus_psf: Option<String>,
-    /// Same-port Proteus with several PSFs, told apart by the fixed bytes their
-    /// first client message opens with; at most one may have none.
-    #[serde(default)]
-    pub proteus_psfs: Vec<String>,
-}
-
-impl HttpConfig {
-    /// Every same-port PSF, `proteus_psf` first.
-    pub fn same_port_psfs(&self) -> Vec<String> {
-        self.proteus_psf
-            .iter()
-            .chain(self.proteus_psfs.iter())
-            .cloned()
-            .collect()
-    }
-}
-
-impl Default for HttpConfig {
-    fn default() -> Self {
-        Self {
-            bind: default_http_bind(),
-            extra_binds: Vec::new(),
-            proxy_protocol: PpMode::Disabled,
-            socket_sndbuf: 0,
-            socket_rcvbuf: 0,
-            allowed_upgrade_hosts: Vec::new(),
-            proteus_psf: None,
-            proteus_psfs: Vec::new(),
-        }
-    }
-}
-
-fn default_http_bind() -> String {
-    "0.0.0.0:80".to_string()
-}
-
-#[derive(Debug, Deserialize)]
 pub struct MetricsConfig {
     /// Where to serve Prometheus metrics. Defaults to loopback.
     #[serde(default = "default_metrics_bind")]
@@ -322,39 +293,13 @@ impl MetricsConfig {
 /// Relay buffer tuning. Per-tunnel heap footprint is dominated by the two relay
 /// buffers (c2t 64KB + t2c 32KB = 96KB/conn). Starting them small and growing
 /// on demand cuts idle-tunnel RSS sharply at ~700k-conn scale.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct RelayConfig {
-    /// Initial size (bytes) of both relay buffers. 0 = current behavior (allocate
-    /// full 64KB/32KB up front). When >0, buffers start at this size and grow on
+    /// Initial size (bytes) of both relay buffers. 0 = allocate the full
+    /// 64KB/32KB up front. When >0, buffers start at this size and grow on
     /// demand up to the protocol caps (65535 c2t, 32768 t2c).
     #[serde(default)]
     pub initial_buffer: usize,
-
-    /// I/O backend for the single-stream tunnel relay hot loop. "epoll" (default) =
-    /// the proven tokio/epoll relay, byte-for-byte unchanged. "iouring" =
-    /// experimental io_uring relay (single-stream path only; MUX2 is unaffected).
-    #[serde(default = "default_io_backend")]
-    pub io_backend: String,
-}
-
-impl Default for RelayConfig {
-    fn default() -> Self {
-        Self {
-            initial_buffer: 0,
-            io_backend: default_io_backend(),
-        }
-    }
-}
-
-fn default_io_backend() -> String {
-    "epoll".to_string()
-}
-
-impl RelayConfig {
-    /// True only when io_backend is explicitly set to the io_uring path.
-    pub fn use_iouring(&self) -> bool {
-        self.io_backend.eq_ignore_ascii_case("iouring")
-    }
 }
 
 impl Default for MetricsConfig {
@@ -376,20 +321,25 @@ impl Config {
             .map_err(|e| anyhow::anyhow!("Failed to read config {}: {}", path, e))?;
         let config: Config =
             toml::from_str(&text).map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
+        config.validate()?;
+        Ok(config)
+    }
 
-        if config.private_key.len() != 64 {
+    /// What a parsed config must satisfy before the server starts.
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.private_key.len() != 64 {
             anyhow::bail!(
                 "private_key must be 64 hex chars (32 bytes), got {}",
-                config.private_key.len()
+                self.private_key.len()
             );
         }
-        if config.public_key.len() != 64 {
+        if self.public_key.len() != 64 {
             anyhow::bail!(
                 "public_key must be 64 hex chars (32 bytes), got {}",
-                config.public_key.len()
+                self.public_key.len()
             );
         }
-        for (i, k) in config.extra_private_keys.iter().enumerate() {
+        for (i, k) in self.extra_private_keys.iter().enumerate() {
             if k.len() != 64 {
                 anyhow::bail!(
                     "extra_private_keys[{i}] must be 64 hex chars, got {}",
@@ -397,8 +347,13 @@ impl Config {
                 );
             }
         }
-
-        Ok(config)
+        if self.proteus.psfs.is_empty() {
+            anyhow::bail!(
+                "[proteus] psfs must name at least one PSF: this server accepts connections \
+                 only through Proteus"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -438,6 +393,10 @@ cids = false
             "{MINIMAL}
 some_future_scalar = 42
 
+[http]
+bind = \"0.0.0.0:80\"
+allowed_upgrade_hosts = []
+
 [tls]
 cert = \"/x\"
 
@@ -467,18 +426,6 @@ unknown_stats_flag = true
         assert_eq!(parse(MINIMAL).relay.initial_buffer, 0);
         let c = parse(&format!("{MINIMAL}\n[relay]\ninitial_buffer = 16384\n"));
         assert_eq!(c.relay.initial_buffer, 16384);
-    }
-
-    #[test]
-    fn the_host_gate_defaults_to_empty_which_is_fail_open() {
-        assert!(
-            parse(MINIMAL).http.allowed_upgrade_hosts.is_empty(),
-            "default changed — the probe gate's fail-open posture moved"
-        );
-        let c = parse(&format!(
-            "{MINIMAL}\n[http]\nallowed_upgrade_hosts = [\"a.example\", \"b.example\"]\n"
-        ));
-        assert_eq!(c.http.allowed_upgrade_hosts.len(), 2);
     }
 
     /// Both new sections must default OFF so that deploying this binary against an
@@ -531,34 +478,46 @@ unknown_stats_flag = true
         );
     }
 
-    /// Like `[protection]` and `[messaging]`: absent means no Proteus listener,
-    /// so an unchanged config starts an unchanged server.
+    /// The listener's defaults: port 443, no PROXY protocol, and no PSF, which
+    /// is the one thing `load` refuses.
     #[test]
-    fn the_proteus_section_is_absent_by_default_and_parses_when_given() {
-        assert!(parse(MINIMAL).proteus.is_none());
+    fn the_proteus_section_defaults_to_443_without_proxy_protocol() {
+        let c = parse(MINIMAL);
+        assert_eq!(c.proteus.bind, "0.0.0.0:443");
+        assert!(c.proteus.extra_binds.is_empty());
+        assert!(c.proteus.psfs.is_empty());
+        assert_eq!(c.proteus.proxy_protocol, PpMode::Disabled);
+        assert_eq!((c.proteus.socket_sndbuf, c.proteus.socket_rcvbuf), (0, 0));
         let c = parse(&format!(
-            "{MINIMAL}\n[proteus]\nbind = \"0.0.0.0:443\"\npsf = \"proteus/tls_mimic.psf\"\n"
+            "{MINIMAL}\n[proteus]\nbind = \"127.0.0.1:8443\"\nextra_binds = [\"[::1]:8443\"]\n\
+             psfs = [\"proteus/tls_mimic.psf\", \"proteus/shadowsocks.psf\"]\n\
+             proxy_protocol = \"auto\"\nsocket_sndbuf = 65536\n"
         ));
-        let p = c.proteus.expect("section present");
-        assert_eq!(p.bind, "0.0.0.0:443");
-        assert_eq!(p.psf, "proteus/tls_mimic.psf");
-        assert!(p.extra_binds.is_empty());
-        let c = parse(&format!(
-            "{MINIMAL}\n[proteus]\nbind = \"0.0.0.0:443\"\npsf = \"x.psf\"\n\
-             extra_binds = [\"[::]:443\"]\n"
-        ));
-        assert_eq!(c.proteus.unwrap().extra_binds, vec!["[::]:443"]);
+        assert_eq!(c.proteus.bind, "127.0.0.1:8443");
+        assert_eq!(c.proteus.extra_binds, vec!["[::1]:8443"]);
+        assert_eq!(
+            c.proteus.psfs,
+            vec!["proteus/tls_mimic.psf", "proteus/shadowsocks.psf"]
+        );
+        assert_eq!(c.proteus.proxy_protocol, PpMode::Auto);
+        assert_eq!(c.proteus.socket_sndbuf, 65536);
     }
 
     #[test]
-    fn same_port_psfs_default_empty_and_merge_the_single_and_list_forms() {
-        assert!(parse(MINIMAL).http.same_port_psfs().is_empty());
-        let c = parse(&format!("{MINIMAL}\n[http]\nproteus_psf = \"a.psf\"\n"));
-        assert_eq!(c.http.same_port_psfs(), vec!["a.psf"]);
-        let c = parse(&format!(
-            "{MINIMAL}\n[http]\nproteus_psf = \"a.psf\"\nproteus_psfs = [\"b.psf\", \"c.psf\"]\n"
-        ));
-        assert_eq!(c.http.same_port_psfs(), vec!["a.psf", "b.psf", "c.psf"]);
+    fn a_config_without_a_psf_is_refused_at_load() {
+        let keyed = format!(
+            "private_key = \"{0}\"\npublic_key = \"{0}\"\n",
+            "a".repeat(64)
+        );
+        let err = parse(&keyed).validate().unwrap_err().to_string();
+        assert!(err.contains("[proteus] psfs"), "{err}");
+        assert!(parse(&format!("{keyed}[proteus]\npsfs = [\"x.psf\"]\n"))
+            .validate()
+            .is_ok());
+        assert!(
+            parse(MINIMAL).validate().is_err(),
+            "short keys are still refused"
+        );
     }
 
     #[test]

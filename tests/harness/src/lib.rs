@@ -1,9 +1,9 @@
 // Copyright 2026 Internet Mastering & Company, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! In-process end-to-end test harness: a real `redsocket-http` listener on loopback, a
-//! MUX2 client (HTTP Upgrade → Noise NK → yamux) that can announce any header,
-//! an echo target, and a RESP2 fake of valkey-main.
+//! In-process end-to-end test harness: a real `redsocket-http` Proteus listener
+//! on loopback, a MUX2 client (Proteus → Noise NK → yamux) that can announce
+//! any header, an echo target, and a RESP2 fake of valkey-main.
 
 pub mod fake_valkey;
 
@@ -13,6 +13,8 @@ use std::task::{Context as TaskContext, Poll};
 
 use anyhow::{anyhow, Result};
 use futures::future::poll_fn;
+use redsocket_http::proteus_carrier::{self, Dispatch, Role, TaskGraphImpl};
+use redsocket_http::proxy_protocol::PpMode;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -20,9 +22,15 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 pub const NOISE_PATTERN: &str = "Noise_NK_25519_ChaChaPoly_BLAKE2s";
 pub const SOCKS5_OK: [u8; 10] = [0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
 
+/// The PSF both ends of the harness speak; its fixed ClientHello needs no password.
+const PSF_NAME: &str = "tls_mimic.psf";
+const PSF: &str = include_str!("../../../proteus/tls_mimic.psf");
+
 pub struct Server {
     pub addr: String,
     pub pubkey: [u8; 32],
+    /// The PSF compiled for the client role, shared by every connection.
+    client_proto: TaskGraphImpl,
 }
 
 pub fn free_port() -> u16 {
@@ -33,23 +41,19 @@ pub fn free_port() -> u16 {
         .port()
 }
 
-/// Start the real HTTP carrier on a free loopback port with a fresh key.
+/// Start the real Proteus carrier on a free loopback port with a fresh key.
 pub async fn start_server() -> Server {
     let (priv_key, pub_key) = redsocket_http::noise::generate_keypair().unwrap();
     let addr = format!("127.0.0.1:{}", free_port());
     let keys = Arc::new(vec![priv_key]);
     let egress: Arc<[String]> = Vec::<String>::new().into();
+    let sources = [(PSF_NAME.to_string(), PSF.to_string())];
+    let dispatch = Arc::new(Dispatch::from_sources(&sources).unwrap());
+    let client_proto = proteus_carrier::compile_text(PSF_NAME, PSF, Role::Client).unwrap();
     let bind = addr.clone();
     tokio::spawn(async move {
-        if let Err(e) = redsocket_http::http::run(
-            &bind,
-            keys,
-            redsocket_http::proxy_protocol::PpMode::Disabled,
-            egress,
-            0,
-            0,
-        )
-        .await
+        if let Err(e) =
+            proteus_carrier::run(&bind, dispatch, keys, PpMode::Disabled, egress, 0, 0).await
         {
             eprintln!("server exited: {e}");
         }
@@ -59,6 +63,7 @@ pub async fn start_server() -> Server {
             return Server {
                 addr,
                 pubkey: pub_key,
+                client_proto,
             };
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -129,51 +134,38 @@ async fn read_frame<S: AsyncRead + Unpin>(s: &mut S) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// TCP → HTTP Upgrade → Noise NK handshake. Returns the socket and session.
-pub async fn upgrade_and_handshake(server: &Server) -> Result<(TcpStream, NoiseSession)> {
-    let mut tcp = TcpStream::connect(&server.addr).await?;
+/// TCP → Proteus interpreter → Noise NK handshake. Returns the carrier's
+/// plaintext side and the session.
+pub async fn connect_and_handshake(server: &Server) -> Result<(DuplexStream, NoiseSession)> {
+    let tcp = TcpStream::connect(&server.addr).await?;
     tcp.set_nodelay(true)?;
-    let req = "GET /noise HTTP/1.1\r\nHost: test.example\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
-    tcp.write_all(req.as_bytes()).await?;
-    tcp.flush().await?;
-    let mut hdr = Vec::new();
-    let mut b = [0u8; 1];
-    loop {
-        tcp.read_exact(&mut b).await?;
-        hdr.push(b[0]);
-        if hdr.ends_with(b"\r\n\r\n") {
-            break;
-        }
-    }
-    let line = String::from_utf8_lossy(&hdr);
-    if !line.starts_with("HTTP/1.1 101") {
-        return Err(anyhow!(
-            "upgrade refused: {}",
-            line.lines().next().unwrap_or("")
-        ));
-    }
+    let peer = tcp.peer_addr()?;
+    let (mut carrier, _interp) = proteus_carrier::wrap(tcp, peer, server.client_proto.clone());
     let mut hs = snow::Builder::new(NOISE_PATTERN.parse()?)
         .remote_public_key(&server.pubkey)
         .build_initiator()?;
     let mut msg1 = vec![0u8; 65535];
     let n1 = hs.write_message(&[], &mut msg1)?;
-    write_frame(&mut tcp, &msg1[..n1]).await?;
-    let msg2 = read_frame(&mut tcp).await?;
+    write_frame(&mut carrier, &msg1[..n1]).await?;
+    let msg2 = read_frame(&mut carrier).await?;
     let mut payload = vec![0u8; 65535];
     hs.read_message(&msg2, &mut payload)?;
     Ok((
-        tcp,
+        carrier,
         NoiseSession {
             transport: hs.into_transport_mode()?,
         },
     ))
 }
 
-fn wrap_noise(tcp: TcpStream, session: NoiseSession) -> DuplexStream {
+fn wrap_noise<S>(carrier: S, session: NoiseSession) -> DuplexStream
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let (caller_side, internal_side) = tokio::io::duplex(64 * 1024);
     let (mut pt_r, mut pt_w) = tokio::io::split(internal_side);
     let session = Arc::new(Mutex::new(session));
-    let (mut tcp_r, mut tcp_w) = tokio::io::split(tcp);
+    let (mut tcp_r, mut tcp_w) = tokio::io::split(carrier);
     let sess_d = session.clone();
     tokio::spawn(async move {
         loop {
@@ -227,10 +219,10 @@ impl MuxClient {
     /// `MUX2|Asia/Dubai|rostam||<cid>||blk1,msg1`.
     pub async fn connect(server: &Server, header: &str) -> Result<MuxClient> {
         use tokio_util::compat::TokioAsyncReadCompatExt;
-        let (mut tcp, mut noise) = upgrade_and_handshake(server).await?;
+        let (mut carrier, mut noise) = connect_and_handshake(server).await?;
         let ct = noise.encrypt(header.as_bytes())?;
-        write_frame(&mut tcp, &ct).await?;
-        let noise_stream = wrap_noise(tcp, noise).compat();
+        write_frame(&mut carrier, &ct).await?;
+        let noise_stream = wrap_noise(carrier, noise).compat();
         let mut cfg = yamux::Config::default();
         cfg.set_max_num_streams(256);
         cfg.set_split_send_size(64 * 1024);
@@ -418,59 +410,4 @@ pub fn ip4(s: &str) -> u32 {
 }
 pub fn ip6(s: &str) -> u128 {
     u128::from(s.parse::<std::net::Ipv6Addr>().unwrap())
-}
-
-/// A `redsocket-http` binary run as a child on a free loopback port with a
-/// minimal config: loopback dialable, no stats, no shedding.
-pub struct ExternalServer {
-    pub server: Server,
-    child: std::process::Child,
-    dir: std::path::PathBuf,
-}
-
-impl Drop for ExternalServer {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
-pub async fn start_external_server(bin: &str) -> ExternalServer {
-    let (priv_key, pub_key) = redsocket_http::noise::generate_keypair().unwrap();
-    let port = free_port();
-    let dir = std::env::temp_dir().join(format!("rs-ext-{}-{}", std::process::id(), port));
-    std::fs::create_dir_all(&dir).unwrap();
-    let cfg = format!(
-        "private_key = \"{}\"\npublic_key = \"{}\"\ndeny_cidrs = []\n\n[http]\nbind = \"127.0.0.1:{port}\"\nproxy_protocol = \"disabled\"\n\n[metrics]\nbind = \"127.0.0.1:0\"\n\n[shed]\nenabled = false\n",
-        hex::encode(priv_key),
-        hex::encode(pub_key)
-    );
-    let path = dir.join("config.toml");
-    std::fs::write(&path, cfg).unwrap();
-    let child = std::process::Command::new(bin)
-        .arg("--config")
-        .arg(&path)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap_or_else(|e| panic!("spawn {bin}: {e}"));
-    let addr = format!("127.0.0.1:{port}");
-
-    let ext = ExternalServer {
-        server: Server {
-            addr: addr.clone(),
-            pubkey: pub_key,
-        },
-        child,
-        dir,
-    };
-    for _ in 0..200 {
-        if TcpStream::connect(&addr).await.is_ok() {
-            return ext;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-    drop(ext);
-    panic!("{bin} did not come up on {addr}");
 }

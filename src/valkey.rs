@@ -11,7 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWrite
 
 /// Connection settings for one Valkey instance. `cert_file`/`key_file` empty
 /// means TLS without client auth (the stats instance's mode).
-#[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
+#[derive(Clone, serde::Deserialize, PartialEq, Eq)]
 pub struct Config {
     pub addr: String,
     #[serde(default = "default_true")]
@@ -26,6 +26,22 @@ pub struct Config {
     pub cert_file: String,
     #[serde(default)]
     pub key_file: String,
+}
+
+/// Everything but the password, which `{:?}` of a `protection::Source` would
+/// otherwise put in the start-up log.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("addr", &self.addr)
+            .field("tls", &self.tls)
+            .field("server_name", &self.server_name)
+            .field("password", &"<redacted>")
+            .field("ca_file", &self.ca_file)
+            .field("cert_file", &self.cert_file)
+            .field("key_file", &self.key_file)
+            .finish()
+    }
 }
 
 fn default_true() -> bool {
@@ -412,5 +428,33 @@ mod tests {
             encode(&[b"HGET", b"k", b"f"]),
             b"*3\r\n$4\r\nHGET\r\n$1\r\nk\r\n$1\r\nf\r\n".to_vec()
         );
+    }
+
+    /// `protection::Source` is logged with `{:?}` at start-up; the password
+    /// must never be in it, the rest must.
+    #[test]
+    fn debug_output_redacts_the_password() {
+        let mut c = Config::plain("127.0.0.1:6379");
+        c.password = "hunter2-very-secret".into();
+        c.server_name = "valkey.example.net".into();
+        c.ca_file = "/etc/redsocket/ca.crt".into();
+        for dbg in [
+            format!("{c:?}"),
+            format!("{c:#?}"),
+            format!("{:?}", crate::protection::Source::Valkey(c.clone())),
+        ] {
+            assert!(!dbg.contains("hunter2-very-secret"), "{dbg}");
+            assert!(dbg.contains("password: \"<redacted>\""), "{dbg}");
+            for shown in [
+                "addr: \"127.0.0.1:6379\"",
+                "tls: ",
+                "server_name: \"valkey.example.net\"",
+                "ca_file: \"/etc/redsocket/ca.crt\"",
+                "cert_file: ",
+                "key_file: ",
+            ] {
+                assert!(dbg.contains(shown), "{dbg} lacks {shown}");
+            }
+        }
     }
 }

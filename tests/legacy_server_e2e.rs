@@ -52,14 +52,3 @@ async fn features_off_is_the_pre_branch_behaviour() {
     assert!(m.is_empty(), "protection off exports nothing: {m}");
     assert_eq!(messaging::ack_streams(), 0);
 }
-
-/// The real pre-branch binary:
-/// `REDSOCKET_BASELINE_BIN=/path/to/dcfa399/redsocket-http cargo test --test
-/// legacy_server_e2e -- --ignored`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
-async fn a_cap_client_against_the_pre_branch_binary() {
-    let bin = std::env::var("REDSOCKET_BASELINE_BIN").expect("REDSOCKET_BASELINE_BIN");
-    let ext = start_external_server(&bin).await;
-    assert_legacy_bytes(&ext.server).await;
-}

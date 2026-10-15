@@ -1,4 +1,4 @@
-# redsocket_http example configuration. Generate the keypair with
+# redsocket_proteus example configuration. Generate the keypair with
 # `redsocket-http --keygen`; the public key goes into the client config.
 private_key = "cd03cbd5399e96297438d5ce91290aeaf7c2cf9ce0a7e561c87522afe9865c34"
 public_key  = "e644c8a4dbc44c56b2e2a1f2587a785fc5813aba74674e151455d51cf86dc405"
@@ -16,28 +16,23 @@ prefer_ipv6 = false
 # Carve-outs checked before deny_cidrs.
 allow_cidrs = []
 
-[http]
-bind = "0.0.0.0:80"
+[proteus]
+# The only listener: every connection runs inside one of the PSFs below and
+# nothing is answered in clear.
+bind = "0.0.0.0:443"
 extra_binds = []
+# Protocol specification files, compiled at start-up; paths are relative to the
+# server's working directory. A connection is routed by the fixed bytes its first
+# message opens with (tls_mimic's ClientHello); the one PSF without fixed first
+# bytes (shadowsocks) takes everything else. Write the shadowsocks password into
+# your copy of that file before use.
+psfs = ["proteus/tls_mimic.psf", "proteus/shadowsocks.psf"]
 # "disabled" unless every connection arrives through a load balancer that
 # prepends a PROXY header; "auto" trusts a PROXY header from any peer.
 proxy_protocol = "disabled"
-# Only these Host values receive a 101; empty allows any Upgrade request.
-allowed_upgrade_hosts = []
 # Socket buffer sizes in bytes; 0 leaves kernel autotuning in place.
 socket_sndbuf = 0
 socket_rcvbuf = 0
-# Same-port Proteus: wrapped and plain clients share bind, told apart by their first bytes.
-# proteus_psfs = ["/etc/redsocket/proteus/tls_mimic.psf", "/etc/redsocket/proteus/shadowsocks.psf"]
-
-# Dedicated Proteus listener; every connection on it is wrapped in the PSF.
-# [proteus]
-# Listen address of the Proteus-wrapped carrier.
-# bind = "0.0.0.0:443"
-# Protocol specification file, compiled once at start-up.
-# psf = "/etc/redsocket/proteus/tls_mimic.psf"
-# More listen addresses for the same PSF.
-# extra_binds = []
 
 [metrics]
 # Loopback unless allow_public is true.
@@ -57,11 +52,9 @@ cids = true
 [relay]
 # Initial relay buffer size in bytes; 0 allocates the full 64K/32K up front.
 initial_buffer = 0
-# "epoll" or "iouring" (Linux only).
-io_backend = "epoll"
 
 [shed]
-# Refuse new tunnels above high_pct of the memory limit, resume below low_pct.
+# Close new connections above high_pct of the memory limit, accept again below low_pct.
 enabled = true
 high_pct = 88
 low_pct = 80

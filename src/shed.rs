@@ -39,13 +39,6 @@ pub fn note_refused() {
     REFUSED.fetch_add(1, Ordering::Relaxed);
 }
 
-/// The response a shedding node sends instead of `101 Switching Protocols`.
-pub const SHED_RESPONSE: &str = "HTTP/1.1 404 Not Found\r\n\
-                                 Content-Type: text/plain\r\n\
-                                 Content-Length: 10\r\n\
-                                 \r\n\
-                                 Not Found\n";
-
 /// Read `(used, limit)` in bytes, preferring the cgroup because that is what
 /// the OOM killer enforces. `None` means we could not tell, which is treated as
 /// healthy.
@@ -137,8 +130,8 @@ pub fn spawn(high_pct: u64, low_pct: u64, interval: Duration) {
                     if !was && pct >= high_pct {
                         SHEDDING.store(true, Ordering::Relaxed);
                         log::warn!(
-                            "[SHED] memory {}% of limit ({:.1} of {:.1} GB) — refusing NEW tunnels \
-                             with 503 so clients fail over; established tunnels are untouched",
+                            "[SHED] memory {}% of limit ({:.1} of {:.1} GB) — closing NEW connections \
+                             so clients fail over; established tunnels are untouched",
                             pct,
                             used as f64 / 1e9,
                             limit as f64 / 1e9
@@ -171,61 +164,23 @@ pub fn spawn(high_pct: u64, low_pct: u64, interval: Duration) {
 mod tests {
     use super::*;
 
-    /// The shed response must be byte-identical to the decoy 404 in http.rs. If
-    /// they ever diverge, a prober can tell a shedding node from a healthy one,
-    /// which is the whole thing this is trying to avoid.
+    /// The configured defaults must leave a gap, or the node flaps between
+    /// states; and shedding at 100% is shedding too late.
     #[test]
-    fn the_shed_response_is_indistinguishable_from_the_decoy() {
-        let decoy = "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 10\r\n\r\nNot Found\n";
-        assert_eq!(
-            SHED_RESPONSE, decoy,
-            "shed response drifted from the http.rs fall-through — it is now externally distinguishable"
-        );
-    }
-
-    /// It must not leak that the box is under pressure.
-    #[test]
-    fn the_shed_response_announces_nothing_about_load() {
-        let low = SHED_RESPONSE.to_ascii_lowercase();
-        for leak in [
-            "retry-after",
-            "server:",
-            "503",
-            "unavailable",
-            "memory",
-            "overload",
-        ] {
-            assert!(!low.contains(leak), "shed response leaks {leak:?}");
-        }
-    }
-
-    /// The exact check the deployed client performs (redsocket-http-
-    /// core/src/tunnel.rs): anything not starting "HTTP/1.1 101" becomes
-    /// ConnectionRefused and it moves to the next endpoint.
-    #[test]
-    fn the_deployed_client_would_reject_and_fail_over() {
-        assert!(!SHED_RESPONSE.starts_with("HTTP/1.1 101"));
-        assert!(SHED_RESPONSE.contains("\r\n\r\n"), "headers must terminate");
-    }
-
-    /// Defaults must leave a gap, or the node flaps between states.
-    #[test]
-    #[allow(clippy::assertions_on_constants)]
     fn the_default_marks_have_an_antiflap_gap() {
+        let defaults = crate::config::ShedConfig::default();
+        assert_eq!((defaults.high_pct, defaults.low_pct), (DEFAULT_HIGH_PCT, DEFAULT_LOW_PCT));
         assert!(
-            DEFAULT_HIGH_PCT > DEFAULT_LOW_PCT,
+            defaults.high_pct > defaults.low_pct,
             "high {} must exceed low {}",
-            DEFAULT_HIGH_PCT,
-            DEFAULT_LOW_PCT
+            defaults.high_pct,
+            defaults.low_pct
         );
         assert!(
-            DEFAULT_HIGH_PCT - DEFAULT_LOW_PCT >= 5,
+            defaults.high_pct - defaults.low_pct >= 5,
             "gap is too narrow to damp"
         );
-        assert!(
-            DEFAULT_HIGH_PCT < 100,
-            "shedding at 100% is shedding too late"
-        );
+        assert!(defaults.high_pct < 100, "shedding at 100% is shedding too late");
     }
 
     /// Reading the live host must not panic and must produce a sane percentage.

@@ -1,27 +1,34 @@
 # redsocket_proteus
 
-The RostamVPN exit server wrapped in [Proteus](https://github.com/unblockable/proteus)
-programmable protocols. It is a strict superset of `redsocket_http`: the same
-exit-node tunnel that hides inside plain HTTP on port 80 (a client performs an
-ordinary HTTP Upgrade, then runs a Noise NK session over the upgraded socket and
-asks the server to CONNECT to TCP destinations, or to relay UDP datagrams, on
-its behalf), with the same optional modules for egress-IP pinning, destination
-deny lists, exit-side domain/IP blocking from a signed bundle, mailbox messaging
-to clients, load shedding, Prometheus metrics and telemetry stats into a Valkey
-list. On top of that, any Proteus protocol specification file (PSF) can be put
-in front of the carrier, on its own port or sharing port 80 with plain clients,
-so the bytes on the wire look like whatever the PSF describes while the tunnel
-inside is unchanged. This repository is intended to replace `redsocket_http`
-once proven and expanded to more protocols.
+The RostamVPN exit server behind [Proteus](https://github.com/unblockable/proteus)
+programmable protocols, and nothing else. A client connects through a Proteus
+protocol specification file (PSF): the bytes on the wire look like whatever the
+PSF describes, and inside the interpreter runs the RedSocket tunnel unchanged —
+a Noise NK session in which the client asks the server to CONNECT to TCP
+destinations, or to relay UDP datagrams, on its behalf — with the same optional
+modules as before for egress-IP pinning, destination deny lists, exit-side
+domain/IP blocking from a signed bundle, mailbox messaging to clients, load
+shedding, Prometheus metrics and telemetry stats into a Valkey list.
+
+This server does not serve legacy clients. There is no plain-HTTP listener, no
+HTTP Upgrade, no WebSocket codec and no 404 decoy: a connection that does not
+open with the bytes of a configured PSF is handed to the one PSF without a fixed
+opening, or closed. The migration path for a fleet with clients that still speak
+the HTTP carrier is `redsocket_http`, which keeps the shared-port compatibility
+mode (plain and Proteus clients on one port); move clients to a PSF there, then
+switch the node to this server.
 
 ## Wire protocol
 
-1. Client sends `GET / HTTP/1.1` with `Upgrade: websocket` and
-   `Connection: Upgrade`; the server answers `HTTP/1.1 101 Switching Protocols`.
-   If `allowed_upgrade_hosts` is set, any other `Host:` gets a 404 instead.
-2. The socket now carries `Noise_NK_25519_ChaChaPoly_BLAKE2s`. Every Noise
-   message is framed as `[u16 BE len][ciphertext]`; the client already knows
-   the server's static X25519 public key.
+1. The client opens a TCP connection and both ends run the same PSF: the client
+   sends the PSF's first client message (for `tls_mimic.psf` a fixed 166-byte
+   ClientHello, answered by a fixed 746-byte ServerHello; for `shadowsocks.psf`
+   an encrypted data frame straight away). From here on every byte of the tunnel
+   is carried in the PSF's data messages.
+2. Inside the carrier the first bytes are the Noise handshake:
+   `Noise_NK_25519_ChaChaPoly_BLAKE2s`, every message framed as
+   `[u16 BE len][ciphertext]`; the client already knows the server's static
+   X25519 public key.
 3. The first encrypted frame is either `META|tz|app|os|cid|sni|caps` (single
    stream, "v1") or `MUX2|tz|app|os|cid|sni|caps` (a yamux carrier). `caps` is a
    comma list such as `blk1,msg1`.
@@ -34,8 +41,9 @@ once proven and expanded to more protocols.
    datagram]` in both directions, and `len == 0` closes it (`docs/udp-over-mux2.md`).
 7. CONNECTs to the pseudo-host `_rs.<cmd>` are in-tunnel control calls.
 
-With a Proteus carrier the whole exchange above runs inside the PSF's messages;
-see "Proteus carrier".
+The client's address, as seen by the stats and the egress pinning, is the socket
+peer, or the source conveyed by a PROXY protocol header when `proxy_protocol`
+is on; there are no HTTP headers to carry it.
 
 ## Build
 
@@ -48,9 +56,8 @@ Proteus itself is vendored in the tree at `third_party/proteus/` and used as a
 path dependency outside the workspace; its `rust-toolchain.toml` applies only
 when cargo is run from inside that directory, so a build from here uses the
 default toolchain (the crate is edition 2024, so Rust 1.85 or newer).
-Binaries: `redsocket-http` (the server), plus `client`, `mux_client`,
-`legacy_client` and `flooder` test clients. Linux builds can select an
-io_uring relay; other platforms always use the tokio relay.
+Binaries: `redsocket-http` (the server) and `client` (a SOCKS5 client that
+speaks the same PSF). The relay is the tokio relay on every platform.
 
 ## Keys
 
@@ -58,7 +65,8 @@ io_uring relay; other platforms always use the tokio relay.
 
 prints a fresh `private_key` / `public_key` pair (hex). Put both in the config;
 clients need only the public key. `--config`, `--bind`, `--private-key` and
-`--public-key` override the file at start-up.
+`--public-key` override the file at start-up; `--bind` replaces
+`[proteus] bind`.
 
 ## Configuration (`config.toml`)
 
@@ -74,23 +82,22 @@ Top level:
 - `allow_cidrs` — carve-outs checked before `deny_cidrs`.
 - `[valkey]` — fallback stats connection if `[stats.valkey]` is absent (same keys).
 
-`[http]`:
+`[proteus]` (the only listener):
 
-- `bind` — listen address, default `0.0.0.0:80`.
-- `extra_binds` — additional listen addresses.
-- `proxy_protocol` — `disabled`, `auto` or `required` PROXY protocol v1/v2 on accept.
+- `bind` — listen address, default `0.0.0.0:443`.
+- `extra_binds` — additional listen addresses for the same PSFs.
+- `psfs` — protocol specification files, compiled once at start-up; at least
+  one is required and the server refuses to start without one, or with one
+  that does not compile, naming the file. Connections are told apart by the
+  fixed bytes their first client message opens with; at most one PSF may have
+  none (see "Dispatch").
+- `proxy_protocol` — `disabled` (default), `auto` or `required`: a PROXY
+  protocol v1/v2 header read before the first bytes are examined, so a load
+  balancer in front can still convey the peer address.
 - `socket_sndbuf` / `socket_rcvbuf` — accepted-socket buffer sizes; 0 keeps the kernel default.
-- `allowed_upgrade_hosts` — `Host:` values that may receive a 101; empty allows any.
-- `proteus_psf` — one PSF whose clients share `bind` and `extra_binds` with
-  plain HTTP clients (same-port mode, see "Proteus carrier").
-- `proteus_psfs` — the list form of the same; `proteus_psf`, if also set, comes first.
 
-`[proteus]` (a dedicated Proteus-wrapped listener; absent by default):
-
-- `bind` — listen address of the wrapped carrier.
-- `psf` — path to the protocol specification file, compiled once at start-up;
-  a PSF that does not compile stops the server, naming the file.
-- `extra_binds` — additional listen addresses for the same PSF.
+An `[http]` section from an older config is ignored, as is any unknown key;
+a config without `[proteus] psfs` is an error.
 
 `[metrics]`:
 
@@ -107,11 +114,11 @@ Top level:
 
 - `initial_buffer` — initial relay buffer size in bytes; 0 allocates the full
   64 KiB / 32 KiB up front, otherwise buffers grow on demand.
-- `io_backend` — `epoll` (default) or `iouring` for the v1 relay loop (Linux only).
 
 `[shed]`:
 
-- `enabled` — refuse new tunnels with a 503 as memory runs out (default `true`).
+- `enabled` — close new connections as memory runs out, before an interpreter
+  is allocated for them, so clients rotate to another node (default `true`).
 - `high_pct` — percent of the memory limit at which refusing starts.
 - `low_pct` — percent at which accepting resumes; must be below `high_pct`.
 - `interval_secs` — seconds between memory samples (default 2).
@@ -141,84 +148,73 @@ Top level:
 (default `true`), `server_name`, `password`, `ca_file`, `cert_file`, `key_file`
 (the last two together enable client-certificate auth).
 
+`config.example.toml` is a complete, commented example that runs both shipped
+PSFs on one port.
+
 ## Proteus carrier
 
 A PSF describes a wire protocol: message layouts, which fields carry the
 length and the payload, fixed bytes, padding, an optional cipher, and who sends
-what in which order. `src/proteus_carrier.rs` runs a Proteus interpreter on
-each accepted socket and gives the HTTP handler the interpreter's application
-side, an in-memory duplex that it treats exactly like a client socket:
+what in which order. `src/proteus_carrier.rs` owns the listener. It compiles
+every PSF at start-up, runs a Proteus interpreter on each accepted socket and
+starts the Noise handshake on the interpreter's application side, an in-memory
+duplex that the tunnel code treats exactly like a client socket:
 
 ```
-TCP socket  ->  Proteus interpreter (server role, compiled once from the PSF)
+TCP socket  ->  PROXY protocol header (optional)
+            ->  first-bytes peek: which PSF?
+            ->  Proteus interpreter (server role, compiled once from the PSF)
             ->  in-memory duplex (64 KiB)
-            ->  HTTP Upgrade request, 101 Switching Protocols
             ->  Noise NK handshake, META / MUX2, SOCKS-style CONNECT
             ->  relay to the destination (single stream or yamux MUX2)
 ```
 
-When the tunnel ends the duplex is dropped, the interpreter sees EOF, flushes
-and shuts the socket down; if it has not unwound after 30 s it is aborted.
-Shedding, the 600 s per-connection budget, socket buffers and keepalives apply
-as on `[http]`; the relay stays on tokio (the io_uring backend is not used
-behind a PSF). The standalone client is the mirror image: `proteus_psf` in
-`client.toml`, or `--proteus-psf <path>` on the command line, compiles the same
-PSF in the client role and puts the interpreter on both of its connect paths
-(single stream and MUX2). Both ends must use the same PSF; with
+Under memory shedding a new socket is dropped before anything is peeked or
+allocated for it. Each connection has a 600 s budget; when the tunnel ends the
+duplex is dropped, the interpreter sees EOF, flushes and shuts the socket down,
+and if it has not unwound after 30 s it is aborted. Socket buffers and TCP
+keepalives (30 s / 10 s) are set on accept. The standalone client is the mirror
+image: `proteus_psf` in `client.toml`, or `--proteus-psf <path>` on the command
+line, is required; it compiles the same PSF in the client role and puts the
+interpreter on both of its connect paths (single stream and MUX2), then starts
+the Noise handshake directly. Both ends must use the same PSF; with
 `proteus/shadowsocks.psf` both must also share the password written into their
 copy, never the `REPLACE_WITH_PASSWORD` placeholder.
 
-### Separate port
+### Dispatch
 
-`[proteus]` binds its own listener; every connection on it goes through the
-interpreter. The PSF is compiled at start-up, so a PSF that does not compile
-stops the server with the path in the error.
+With several PSFs on one port the server peeks at a connection's first bytes,
+consuming nothing, for at most 5 s, and routes:
+
+- bytes matching the fixed opening of a configured PSF go to that PSF, the
+  longest match first; for `tls_mimic.psf` that is its 166-byte ClientHello;
+- otherwise the one PSF whose first client message has no fixed opening (the
+  default, e.g. `shadowsocks.psf`) takes the connection; with no default it is
+  closed;
+- a peer that sends nothing within 5 s is closed.
 
 ```toml
 [proteus]
 bind = "0.0.0.0:443"
-psf = "/etc/redsocket/proteus/tls_mimic.psf"
-extra_binds = ["[::]:443"]
+psfs = ["/etc/redsocket/proteus/tls_mimic.psf", "/etc/redsocket/proteus/shadowsocks.psf"]
 ```
 
-### Same port
-
-`[http] proteus_psf` or `proteus_psfs` lets wrapped clients share the HTTP
-listener (and every `extra_binds`) with plain clients. After the PROXY-protocol
-step the server peeks at a connection's first bytes, consuming nothing, for at
-most the usual 5 s header deadline, and routes:
-
-- a request line `METHOD /path HTTP/1.` with METHOD one of GET, POST, PUT,
-  HEAD, OPTIONS or CONNECT goes to the HTTP handler unchanged — RedSocket
-  clients get their 101, anything else the 404 decoy, as before;
-- otherwise the bytes are matched against the fixed opening bytes of the
-  configured PSFs, longest first; for `tls_mimic.psf` that is its 166-byte
-  ClientHello;
-- otherwise the one PSF whose first client message has no fixed opening (the
-  default, e.g. `shadowsocks.psf`) takes the connection; with no default it is
-  closed.
-
-```toml
-[http]
-bind = "0.0.0.0:80"
-proteus_psfs = ["/etc/redsocket/proteus/tls_mimic.psf", "/etc/redsocket/proteus/shadowsocks.psf"]
-```
-
-Every PSF is compiled at start-up and the log line `proteus shared:` names
-each with `(prefix N bytes)` or `(default)`. `[proteus]` and the same-port keys
-can be combined. Limits of the same-port mode, by design:
+The start-up log line `proteus psfs:` names each PSF with `(prefix N bytes)` or
+`(default)`. Limits, by design:
 
 - there is no version byte or other marker; dispatch relies on what a PSF's
   first client message looks like;
 - two PSFs whose first client bytes are not fixed (random, encrypted,
   length-prefixed) cannot be told apart, so the server refuses to start with
   more than one such PSF in the list;
-- a fixed opening that is itself a valid HTTP request line is routed as HTTP;
-- non-HTTP bytes that no PSF claims go to the default PSF, which fails inside
-  the interpreter and closes, or are closed outright, instead of the 400/404 a
-  plain listener answers;
-- a peer that sends an HTTP-looking fragment and then stalls is handed to the
-  HTTP handler at the peek deadline, so its 400 can take up to 10 s instead of 5.
+- nothing answers HTTP: a clear-text `GET` or `Upgrade` is bytes like any
+  other, taken by the default PSF or closed outright. With `shadowsocks.psf`
+  as the default its first 18 bytes fail the authentication tag on the length
+  field and the connection is closed at once; a default PSF whose length field
+  is not authenticated would instead hold the connection, silent, until the
+  600 s cap;
+- bytes that no PSF claims go to the default PSF, which fails inside the
+  interpreter and closes, or are closed outright.
 
 ### Experimental status
 
@@ -236,10 +232,10 @@ Two PSFs ship in `proteus/`:
 
 - `tls_mimic.psf` — a fixed 166-byte ClientHello, a fixed 746-byte ServerHello,
   then `17 03 03 | u16 length | payload` records. No encryption of its own. Its
-  fixed first message makes it dispatchable on a shared port.
+  fixed first message makes it dispatchable next to a default PSF.
 - `shadowsocks.psf` — `u16 length | 16-byte tag | payload | 16-byte tag`, all
   ChaCha20-Poly1305 under a key derived from `PASSWORD`. Nothing fixed on the
-  wire, so on a shared port it can only be the default.
+  wire, so it can only be the default.
 
 A PSF has four segments: `@SEGMENT.FORMATS` (message layouts),
 `@SEGMENT.SEMANTICS` (which field is the length, the payload, fixed bytes,
@@ -250,9 +246,9 @@ cipher, which fields are encrypted). The upstream examples are in
 `third_party/proteus/src/lang/compiler/proteus_lite.pest`. For your own: keep
 one length field and one payload field per data message, keep the length a
 `u16` so a 64 KiB relay chunk fits, and give the first client message a
-`FIXED_BYTES` or `FIXED_STRING` first field if the PSF is meant for a shared
-port. The server validates a PSF at start-up and refuses one that does not
-compile, naming the file.
+`FIXED_BYTES` or `FIXED_STRING` first field if the PSF is meant to share a
+port with a default one. The server validates every PSF at start-up and
+refuses one that does not compile, naming the file.
 
 ### End-to-end script
 
@@ -261,20 +257,17 @@ compile, naming the file.
 ```
 
 builds the debug `redsocket-http` and `client` binaries and runs the whole
-stack on loopback: a small HTTP origin, the server with `[http]` on 18080 and
-`[proteus]` on 18443, and `curl` through the client's SOCKS5 port. For
-`tls_mimic.psf` and `shadowsocks.psf` (with a random password patched into a
-temporary copy) it proves that the origin file comes back through the Proteus
-carrier on both the single-stream and the MUX2 path, that a clear-text HTTP
-Upgrade to the Proteus port never gets a 101 while the same request to the
-HTTP port does, and, for `tls_mimic`, that the fixed ClientHello is answered
-with the fixed ServerHello. It then restarts the server with both PSFs on the
-HTTP port alone and proves that a plain, a tls_mimic and a shadowsocks client
-all work on that one port, that a GET without Upgrade still gets the 404 decoy
-and that a clear-text Upgrade still gets 101. `ORIGIN_PORT`, `HTTP_PORT`,
-`PROTEUS_PORT`, `METRICS_PORT` and `SOCKS_PORT` override the ports; the script
-refuses to start on a port already in use and kills every process it started
-on exit.
+stack on loopback: a small HTTP origin, the server with `tls_mimic.psf` and
+`shadowsocks.psf` (with a random password patched into a temporary copy) on one
+Proteus port, and `curl` through the client's SOCKS5 port. It proves that the
+origin file comes back through each PSF on both the single-stream and the MUX2
+path, that a clear-text HTTP `GET` and `Upgrade` to the Proteus port get
+neither a 101 nor a 404 (it prints whether the connection was closed or
+silent; with the shipped PSFs it is closed), that the fixed ClientHello is
+answered with the fixed ServerHello and that random bytes get the connection
+closed. `ORIGIN_PORT`, `PROTEUS_PORT`,
+`METRICS_PORT` and `SOCKS_PORT` override the ports; the script refuses to start
+on a port already in use and kills every process it started on exit.
 
 ### Vendored Proteus
 
@@ -283,8 +276,8 @@ on exit.
 library: `src/lib.rs` was added (`pub mod cli; pub mod crypto; pub mod lang;
 pub mod net; pub mod util;`), `src/main.rs` was reduced to a call into
 `proteus::cli::run`, and `src/lang/mod.rs` exports `pub mod types` so the
-server can read a parsed PSF's field semantics to find same-port dispatch
-prefixes. Nothing else was touched; its own `LICENSE`, `README.md`,
+server can read a parsed PSF's field semantics to find dispatch prefixes.
+Nothing else was touched; its own `LICENSE`, `README.md`,
 `rust-toolchain.toml` and tests are as upstream.
 
 ## Telemetry stats
@@ -304,12 +297,13 @@ instance is unreachable; the tunnel itself is never delayed by the stats.
 
 ## Tests
 
-`cargo test` runs the unit tests, including the same-port classifier and the
-`[proteus]` / `proteus_psfs` config keys, and six end-to-end tests. Each e2e
-test is its own binary because the protection module is initialised once per
-process; the shared harness (in-process server, MUX2 client, echo target and a
-RESP2 fake of Valkey) lives in `tests/harness/`. The Proteus carrier is proven
-with the real binaries by `scripts/proteus-e2e.sh` (see above).
+`cargo test` runs the unit tests, including the dispatch table and the
+`[proteus]` config section, and six end-to-end tests. Each e2e test is its own
+binary because the protection module is initialised once per process; the
+shared harness (in-process Proteus listener, a client that wraps its socket in
+the same PSF in the client role before the Noise/MUX2 steps, echo target and a
+RESP2 fake of Valkey) lives in `tests/harness/`. The carrier is proven with the
+real binaries by `scripts/proteus-e2e.sh` (see above).
 
 ## License
 
@@ -331,7 +325,7 @@ The other vendored dependencies in `vendor/` keep their own license files.
 
 | Repository | Contents |
 |---|---|
-| `redsocket_http` | The exit server this repository extends (Rust). |
+| `redsocket_http` | The exit server this repository derives from (Rust); keeps the HTTP carrier and the shared-port compatibility mode for legacy clients. |
 | `rostamvpn-android` | The Android app, the shared Rust client core (`redsocket-http-core/`) and the WireGuard-over-TCP core. |
 | `rostamvpn-ios` | The iOS app and its Network Extension; its core frameworks are built from the cores in `rostamvpn-android`. |
 | `redsocket_pfe` | AF_XDP triangle-routing front-end. |

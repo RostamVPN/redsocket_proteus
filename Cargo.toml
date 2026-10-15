@@ -1,10 +1,10 @@
 [package]
 name = "redsocket-http"
-version = "3.4.0"
+version = "3.5.0"
 edition = "2021"
 rust-version = "1.87"
 license = "Apache-2.0"
-description = "RedSocket HTTP-Upgrade standalone — Noise NK tunnel on port 80, optionally behind a Proteus programmable protocol"
+description = "RedSocket exit server behind Proteus programmable protocols — the Noise NK tunnel is reachable only through a PSF-shaped carrier"
 
 [workspace]
 members = ["tests/harness"]
@@ -21,9 +21,7 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 base64 = "0.22"
 hex = "0.4"
-sha1 = "0.10"
 sha2 = "0.10"
-memchr = "2"
 
 socket2 = { version = "0.5", features = ["all"] }
 
@@ -38,7 +36,6 @@ env_logger = "0.11"
 
 anyhow = "1"
 
-once_cell = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 mimalloc = { version = "0.1", default-features = false }
@@ -60,9 +57,6 @@ proteus = { path = "third_party/proteus" }
 
 [dev-dependencies]
 e2e-harness = { path = "tests/harness" }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-io-uring = "0.6.4"
 
 [profile.release]
 opt-level = 3

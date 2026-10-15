@@ -1,7 +1,7 @@
 // Copyright 2026 Internet Mastering & Company, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! RedSocket standalone client — HTTP-Upgrade + Noise NK + META + SOCKS5.
+//! RedSocket standalone client — Proteus + Noise NK + META + SOCKS5.
 
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -15,11 +15,6 @@ use proteus::lang::Role;
 use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-
-/// The carrier socket as the tunnel code sees it: plain TCP, or the
-/// application side of a Proteus interpreter.
-trait Carrier: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> Carrier for T {}
 
 /// Compile a client-role PSF, with the path in the error message. The Proteus
 /// parser panics on malformed input; that becomes an error here.
@@ -35,12 +30,8 @@ fn compile_client_psf(path: &str) -> Result<TaskGraphImpl> {
     }
 }
 
-/// Put a Proteus interpreter between the TCP socket and the tunnel code. With
-/// no PSF the socket is returned as is.
-fn wrap_proteus(tcp: TcpStream, proto: Option<&TaskGraphImpl>) -> Box<dyn Carrier> {
-    let Some(proto) = proto else {
-        return Box::new(tcp);
-    };
+/// Put a Proteus interpreter between the TCP socket and the tunnel code.
+fn wrap_proteus(tcp: TcpStream, proto: &TaskGraphImpl) -> tokio::io::DuplexStream {
     let (app_side, interp_side) = tokio::io::duplex(64 * 1024);
     let (net_r, net_w) = tcp.into_split();
     let (int_r, int_w) = tokio::io::split(interp_side);
@@ -51,7 +42,7 @@ fn wrap_proteus(tcp: TcpStream, proto: Option<&TaskGraphImpl>) -> Box<dyn Carrie
             log::debug!("[proteus] interpreter ended: {}", e);
         }
     });
-    Box::new(app_side)
+    app_side
 }
 
 /// SOCKS5 reply X'07' — command not supported.
@@ -173,16 +164,13 @@ fn detect_os() -> String {
 /// Client config (TOML). All settings in one file.
 #[derive(Debug, Deserialize)]
 struct ClientConfig {
-    /// Server address (ip:port or just ip, default port 80).
+    /// Server address (ip:port or just ip, default port 443).
     pub server: String,
     /// Server Noise public key (hex, 64 chars).
     pub pubkey: String,
     /// Local SOCKS5 listen port.
     #[serde(default = "default_listen")]
     pub listen: u16,
-    /// HTTP Host header for the Upgrade request (front/camouflage domain).
-    #[serde(default = "default_host")]
-    pub host: String,
     /// Use MUX2 (yamux) — one carrier multiplexes all SOCKS5 requests.
     #[serde(default)]
     pub mux: bool,
@@ -191,7 +179,8 @@ struct ClientConfig {
     pub max_streams: usize,
     /// Client ID (auto-generated if omitted).
     pub cid: Option<String>,
-    /// Proteus protocol specification wrapped around the carrier (optional).
+    /// Proteus protocol specification wrapped around the carrier; `--proteus-psf`
+    /// overrides it, and one of the two is required.
     pub proteus_psf: Option<String>,
     /// META frame fields sent inside the encrypted channel.
     #[serde(default)]
@@ -214,9 +203,6 @@ pub struct MetaConfig {
 
 fn default_listen() -> u16 {
     1080
-}
-fn default_host() -> String {
-    "example.com".to_string()
 }
 fn default_app() -> String {
     "redsocket-client".to_string()
@@ -266,7 +252,7 @@ async fn main() -> Result<()> {
         Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) => {
             (h.to_string(), p.parse::<u16>().unwrap())
         }
-        _ => (cfg.server.clone(), 80),
+        _ => (cfg.server.clone(), 443),
     };
 
     let pubkey_bytes = hex::decode(&cfg.pubkey).map_err(|e| anyhow!("bad pubkey hex: {e}"))?;
@@ -278,48 +264,46 @@ async fn main() -> Result<()> {
     let cid = cfg.cid.unwrap_or_else(gen_cid);
     let tz = cfg.meta.tz.unwrap_or_else(detect_tz);
     let os = cfg.meta.os.unwrap_or_else(detect_os);
-    let psf_path = args.proteus_psf.or(cfg.proteus_psf);
-    let proto = match &psf_path {
-        Some(p) => Some(compile_client_psf(p)?),
-        None => None,
-    };
+    let psf_path = args.proteus_psf.or(cfg.proteus_psf).ok_or_else(|| {
+        anyhow!("proteus_psf is required: set it in the config or pass --proteus-psf")
+    })?;
+    let proto = compile_client_psf(&psf_path)?;
 
     eprintln!(
-        "[client] config={} server={}:{} host={} cid={} tz={} app={} os={} mux={} proteus={}",
+        "[client] config={} server={}:{} psf={} cid={} tz={} app={} os={} mux={}",
         args.config,
         host,
         port,
-        cfg.host,
+        psf_path,
         &cid[..8.min(cid.len())],
         tz,
         cfg.meta.app,
         os,
-        cfg.mux,
-        psf_path.as_deref().unwrap_or("off")
+        cfg.mux
     );
 
     let listener = TcpListener::bind(format!("127.0.0.1:{}", cfg.listen)).await?;
     eprintln!(
         "[client] SOCKS5 listening on 127.0.0.1:{} ({})",
         cfg.listen,
-        if cfg.mux { "MUX2/yamux" } else { "legacy" }
+        if cfg.mux { "MUX2/yamux" } else { "single-stream" }
     );
 
+    let carrier = CarrierConfig {
+        server_host: host,
+        server_port: port,
+        server_pubkey: pubkey,
+        cid,
+        tz,
+        app: cfg.meta.app,
+        os,
+        sni: cfg.meta.sni,
+        max_streams: cfg.max_streams,
+        proto,
+    };
+
     if cfg.mux {
-        let open_tx = start_mux_supervisor(MuxCarrierConfig {
-            server_host: host.clone(),
-            server_port: port,
-            front_host: cfg.host.clone(),
-            server_pubkey: pubkey,
-            cid: cid.clone(),
-            tz: tz.clone(),
-            app: cfg.meta.app.clone(),
-            os: os.clone(),
-            sni: cfg.meta.sni.clone(),
-            max_streams: cfg.max_streams,
-            proto,
-        })
-        .await?;
+        let open_tx = start_mux_supervisor(carrier).await?;
 
         loop {
             let (socks_conn, peer) = listener.accept().await?;
@@ -331,33 +315,12 @@ async fn main() -> Result<()> {
             });
         }
     } else {
+        let carrier = Arc::new(carrier);
         loop {
             let (socks_conn, peer) = listener.accept().await?;
-            let host = host.clone();
-            let front = cfg.host.clone();
-            let cid = cid.clone();
-            let tz = tz.clone();
-            let app = cfg.meta.app.clone();
-            let os = os.clone();
-            let sni = cfg.meta.sni.clone();
-            let proto = proto.clone();
-
+            let carrier = carrier.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_socks(
-                    socks_conn,
-                    &host,
-                    port,
-                    &front,
-                    &pubkey,
-                    &cid,
-                    &tz,
-                    &app,
-                    &os,
-                    &sni,
-                    proto.as_ref(),
-                )
-                .await
-                {
+                if let Err(e) = handle_socks(socks_conn, &carrier).await {
                     log::debug!("[client] {} tunnel error: {}", peer, e);
                 }
             });
@@ -366,20 +329,7 @@ async fn main() -> Result<()> {
 }
 
 /// Handle a SOCKS5 connection: parse CONNECT, open tunnel, relay.
-#[allow(clippy::too_many_arguments)]
-async fn handle_socks(
-    mut socks: TcpStream,
-    server_host: &str,
-    server_port: u16,
-    front_host: &str,
-    server_pubkey: &[u8; 32],
-    cid: &str,
-    tz: &str,
-    app: &str,
-    os: &str,
-    sni: &str,
-    proto: Option<&TaskGraphImpl>,
-) -> Result<()> {
+async fn handle_socks(mut socks: TcpStream, carrier: &CarrierConfig) -> Result<()> {
     let mut buf = [0u8; 257];
     socks.read_exact(&mut buf[..2]).await?;
     if buf[0] != 0x05 {
@@ -396,7 +346,7 @@ async fn handle_socks(
     if buf[1] != 0x01 {
         let _ = socks.write_all(&SOCKS5_CMD_UNSUPPORTED).await;
         return Err(anyhow!(
-            "unsupported SOCKS5 command {} (legacy mode)",
+            "unsupported SOCKS5 command {} (single-stream mode)",
             buf[1]
         ));
     }
@@ -432,49 +382,34 @@ async fn handle_socks(
         "[client] CONNECT {}:{} via {}:{}",
         dest_host,
         dest_port,
-        server_host,
-        server_port
+        carrier.server_host,
+        carrier.server_port
     );
 
     socks
         .write_all(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
         .await?;
 
-    let tcp = TcpStream::connect(format!("{}:{}", server_host, server_port))
+    let tcp = TcpStream::connect(format!("{}:{}", carrier.server_host, carrier.server_port))
         .await
         .context("connect to server")?;
-    let mut tcp = wrap_proteus(tcp, proto);
-
-    let req = format!(
-        "GET /noise HTTP/1.1\r\nHost: {}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
-        front_host
-    );
-    tcp.write_all(req.as_bytes()).await?;
-    tcp.flush().await?;
-
-    let mut resp = vec![0u8; 1024];
-    let n = tcp.read(&mut resp).await?;
-    let resp_str = std::str::from_utf8(&resp[..n]).unwrap_or("");
-    if !resp_str.starts_with("HTTP/1.1 101") {
-        return Err(anyhow!(
-            "upgrade failed: {}",
-            resp_str.lines().next().unwrap_or("")
-        ));
-    }
-    log::info!("[client] 101 OK");
+    let tcp = wrap_proteus(tcp, &carrier.proto);
 
     let (mut tcp_r, mut tcp_w) = tokio::io::split(tcp);
-    let mut noise = noise_handshake(&mut tcp_r, &mut tcp_w, server_pubkey).await?;
+    let mut noise = noise_handshake(&mut tcp_r, &mut tcp_w, &carrier.server_pubkey).await?;
 
-    let meta = format!("META|{}|{}|{}|{}|{}", tz, app, os, cid, sni);
+    let meta = format!(
+        "META|{}|{}|{}|{}|{}",
+        carrier.tz, carrier.app, carrier.os, carrier.cid, carrier.sni
+    );
     let meta_ct = noise.encrypt(meta.as_bytes())?;
     write_frame(&mut tcp_w, &meta_ct).await?;
     log::info!(
         "[client] META sent (tz={} app={} os={} cid={}...)",
-        tz,
-        app,
-        os,
-        &cid[..8.min(cid.len())]
+        carrier.tz,
+        carrier.app,
+        carrier.os,
+        &carrier.cid[..8.min(carrier.cid.len())]
     );
 
     let mut connect = Vec::with_capacity(256);
@@ -625,11 +560,11 @@ enum SupervisorRequest {
     Reset,
 }
 
+/// Everything a carrier needs: where the server is, who we are, and the PSF.
 #[derive(Clone)]
-struct MuxCarrierConfig {
+struct CarrierConfig {
     server_host: String,
     server_port: u16,
-    front_host: String,
     server_pubkey: [u8; 32],
     cid: String,
     tz: String,
@@ -637,7 +572,7 @@ struct MuxCarrierConfig {
     os: String,
     sni: String,
     max_streams: usize,
-    proto: Option<TaskGraphImpl>,
+    proto: TaskGraphImpl,
 }
 
 fn spawn_yamux_driver(
@@ -741,29 +676,10 @@ where
     }
 }
 
-async fn connect_mux_carrier(
-    config: &MuxCarrierConfig,
-) -> Result<(OpenTx, tokio::task::JoinHandle<()>)> {
-    establish_mux2_carrier(
-        &config.server_host,
-        config.server_port,
-        &config.front_host,
-        &config.server_pubkey,
-        &config.cid,
-        &config.tz,
-        &config.app,
-        &config.os,
-        &config.sni,
-        config.max_streams,
-        config.proto.as_ref(),
-    )
-    .await
-}
-
-async fn reconnect_mux_carrier(config: &MuxCarrierConfig) -> (OpenTx, tokio::task::JoinHandle<()>) {
+async fn reconnect_mux_carrier(config: &CarrierConfig) -> (OpenTx, tokio::task::JoinHandle<()>) {
     let mut delay = std::time::Duration::from_millis(250);
     loop {
-        match connect_mux_carrier(config).await {
+        match establish_mux2_carrier(config).await {
             Ok(carrier) => {
                 log::info!("[mux] carrier connected");
                 return carrier;
@@ -777,8 +693,8 @@ async fn reconnect_mux_carrier(config: &MuxCarrierConfig) -> (OpenTx, tokio::tas
     }
 }
 
-async fn start_mux_supervisor(config: MuxCarrierConfig) -> Result<SupervisorTx> {
-    let (mut carrier_tx, mut driver) = connect_mux_carrier(&config).await?;
+async fn start_mux_supervisor(config: CarrierConfig) -> Result<SupervisorTx> {
+    let (mut carrier_tx, mut driver) = establish_mux2_carrier(&config).await?;
     let (supervisor_tx, mut requests) = tokio::sync::mpsc::channel::<SupervisorRequest>(64);
 
     tokio::spawn(async move {
@@ -885,25 +801,13 @@ async fn open_mux_target(
     unreachable!()
 }
 
-/// Establish a MUX2 carrier: TCP → HTTP Upgrade → Noise NK → MUX2 header →
-/// yamux.
-#[allow(clippy::too_many_arguments)]
+/// Establish a MUX2 carrier: TCP → Proteus → Noise NK → MUX2 header → yamux.
 async fn establish_mux2_carrier(
-    server_host: &str,
-    server_port: u16,
-    front_host: &str,
-    server_pubkey: &[u8; 32],
-    cid: &str,
-    tz: &str,
-    app: &str,
-    os: &str,
-    sni: &str,
-    max_streams: usize,
-    proto: Option<&TaskGraphImpl>,
+    carrier: &CarrierConfig,
 ) -> Result<(OpenTx, tokio::task::JoinHandle<()>)> {
     use tokio_util::compat::TokioAsyncReadCompatExt;
 
-    let tcp = TcpStream::connect(format!("{}:{}", server_host, server_port))
+    let tcp = TcpStream::connect(format!("{}:{}", carrier.server_host, carrier.server_port))
         .await
         .context("connect to server")?;
 
@@ -913,44 +817,29 @@ async fn establish_mux2_carrier(
     socket2::SockRef::from(&tcp)
         .set_tcp_keepalive(&keepalive)
         .context("set carrier TCP keepalive")?;
-    let mut tcp = wrap_proteus(tcp, proto);
-
-    let req = format!(
-        "GET /noise HTTP/1.1\r\nHost: {}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
-        front_host
-    );
-    tcp.write_all(req.as_bytes()).await?;
-    tcp.flush().await?;
-
-    let mut resp = vec![0u8; 1024];
-    let n = tcp.read(&mut resp).await?;
-    let resp_str = std::str::from_utf8(&resp[..n]).unwrap_or("");
-    if !resp_str.starts_with("HTTP/1.1 101") {
-        return Err(anyhow!(
-            "upgrade failed: {}",
-            resp_str.lines().next().unwrap_or("")
-        ));
-    }
-    log::info!("[mux] 101 OK");
+    let tcp = wrap_proteus(tcp, &carrier.proto);
 
     let (mut tcp_r, mut tcp_w) = tokio::io::split(tcp);
-    let mut noise = noise_handshake(&mut tcp_r, &mut tcp_w, server_pubkey).await?;
+    let mut noise = noise_handshake(&mut tcp_r, &mut tcp_w, &carrier.server_pubkey).await?;
 
-    let mux2 = format!("MUX2|{}|{}|{}|{}|{}", tz, app, os, cid, sni);
+    let mux2 = format!(
+        "MUX2|{}|{}|{}|{}|{}",
+        carrier.tz, carrier.app, carrier.os, carrier.cid, carrier.sni
+    );
     let ct = noise.encrypt(mux2.as_bytes())?;
     write_frame(&mut tcp_w, &ct)
         .await
         .map_err(|e| anyhow!("send MUX2 header: {e}"))?;
     log::info!(
         "[mux] MUX2 header sent (cid={}...)",
-        &cid[..8.min(cid.len())]
+        &carrier.cid[..8.min(carrier.cid.len())]
     );
 
     let tcp = tcp_r.unsplit(tcp_w);
 
     let noise_stream = wrap_noise_stream(tcp, noise).compat();
     let mut cfg = yamux::Config::default();
-    cfg.set_max_num_streams(max_streams);
+    cfg.set_max_num_streams(carrier.max_streams);
     cfg.set_split_send_size(64 * 1024);
     let conn = yamux::Connection::new(noise_stream, cfg, yamux::Mode::Client);
     let (open_tx, driver) = spawn_yamux_driver(conn);

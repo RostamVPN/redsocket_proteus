@@ -1,9 +1,9 @@
-server = "127.0.0.1:80"
+server = "127.0.0.1:443"
 pubkey = "e644c8a4dbc44c56b2e2a1f2587a785fc5813aba74674e151455d51cf86dc405"
 
 listen = 1080
 
-host = "example.com"
+proteus_psf = "proteus/tls_mimic.psf"
 
 mux = false
 max_streams = 256
