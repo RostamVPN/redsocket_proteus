@@ -174,7 +174,7 @@ where
     }
 
     let (up, down) = tunnel.bytes.get();
-    log::info!(
+    log::debug!(
         "[MUX2] tunnel closed ip={} cid={} age={}s bytes_up={} bytes_down={}",
         real_ip,
         client_cid.as_deref().unwrap_or(""),
