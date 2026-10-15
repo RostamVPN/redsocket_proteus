@@ -17,7 +17,7 @@ use proteus::lang::compiler::Compiler;
 pub use proteus::lang::compiler::TaskGraphImpl;
 use proteus::lang::interpreter::Interpreter;
 use proteus::lang::ir::bridge::OldCompile;
-use proteus::lang::types::FieldSemantic;
+use proteus::lang::types::{FieldSemantic, Psf};
 pub use proteus::lang::Role;
 use tokio::io::DuplexStream;
 use tokio::net::{TcpListener, TcpStream};
@@ -61,24 +61,33 @@ pub fn compile_text(psf_path: &str, text: &str, role: Role) -> anyhow::Result<Ta
     guarded(psf_path, || Compiler::parse_content(text, role))
 }
 
+/// The password shipped in `proteus/shadowsocks.psf`, to be replaced before use.
+const PLACEHOLDER_PASSWORD: &str = "REPLACE_WITH_PASSWORD";
+
+/// Parse PSF text, refusing a crypto password left at the shipped placeholder.
+fn parse(psf_path: &str, text: &str) -> anyhow::Result<Psf> {
+    let psf = guarded(psf_path, || parse_psf(text))?;
+    let password = psf.crypto_spec.as_ref().and_then(|c| c.password.as_ref());
+    if password.is_some_and(|p| p.0 == PLACEHOLDER_PASSWORD) {
+        anyhow::bail!(
+            "[PROTEUS] PSF {psf_path} still has the placeholder password {PLACEHOLDER_PASSWORD}; \
+             write your own into your copy"
+        );
+    }
+    Ok(psf)
+}
+
 /// The bytes a client of this PSF sends first, when its first message opens
 /// with a fixed field; `None` when the first client bytes are not predictable.
-pub fn fixed_prefix(psf_path: &str, text: &str) -> anyhow::Result<Option<Vec<u8>>> {
-    let psf = guarded(psf_path, || parse_psf(text))?;
-    let Some(first) = psf.sequence.iter().find(|s| s.role == Role::Client) else {
-        return Ok(None);
-    };
-    let Some(fmt) = psf.formats.get(&first.format) else {
-        return Ok(None);
-    };
-    let Some(field) = fmt.format.format.fields.first() else {
-        return Ok(None);
-    };
-    Ok(match fmt.semantics.as_ref().get(&field.name) {
+fn fixed_prefix(psf: &Psf) -> Option<Vec<u8>> {
+    let first = psf.sequence.iter().find(|s| s.role == Role::Client)?;
+    let fmt = psf.formats.get(&first.format)?;
+    let field = fmt.format.format.fields.first()?;
+    match fmt.semantics.as_ref().get(&field.name) {
         Some(FieldSemantic::FixedBytes(b)) => Some(b.clone()),
         Some(FieldSemantic::FixedString(s)) => Some(s.as_bytes().to_vec()),
         _ => None,
-    })
+    }
 }
 
 /// Where the first bytes of a connection send it.
@@ -179,8 +188,9 @@ impl Dispatch {
         let mut prefixes = Vec::new();
         let mut default = None;
         for (i, (name, text)) in sources.iter().enumerate() {
+            let psf = parse(name, text)?;
             protos.push(compile_text(name, text, Role::Server)?);
-            match fixed_prefix(name, text)? {
+            match fixed_prefix(&psf) {
                 Some(p) => prefixes.push((p, i)),
                 None => match default {
                     None => default = Some(i),
@@ -406,10 +416,14 @@ mod tests {
     const TLS_MIMIC: &str = include_str!("../proteus/tls_mimic.psf");
     const SHADOWSOCKS: &str = include_str!("../proteus/shadowsocks.psf");
 
+    /// `shadowsocks.psf` with a password written in, as an operator's copy.
+    fn shadowsocks() -> String {
+        SHADOWSOCKS.replace(PLACEHOLDER_PASSWORD, "test-password")
+    }
+
     /// The 166-byte ClientHello from `tls_mimic.psf`.
     fn client_hello() -> Vec<u8> {
-        fixed_prefix("tls_mimic.psf", TLS_MIMIC)
-            .unwrap()
+        fixed_prefix(&parse("tls_mimic.psf", TLS_MIMIC).unwrap())
             .expect("tls_mimic opens with FIXED_BYTES")
     }
 
@@ -426,7 +440,7 @@ mod tests {
     fn both() -> Dispatch {
         Dispatch::from_sources(&[
             ("tls_mimic.psf".to_string(), TLS_MIMIC.to_string()),
-            ("shadowsocks.psf".to_string(), SHADOWSOCKS.to_string()),
+            ("shadowsocks.psf".to_string(), shadowsocks()),
         ])
         .unwrap()
     }
@@ -514,14 +528,27 @@ mod tests {
     #[test]
     fn two_psfs_without_a_fixed_prefix_are_rejected() {
         let err = Dispatch::from_sources(&[
-            ("a.psf".to_string(), SHADOWSOCKS.to_string()),
+            ("a.psf".to_string(), shadowsocks()),
             ("tls_mimic.psf".to_string(), TLS_MIMIC.to_string()),
-            ("b.psf".to_string(), SHADOWSOCKS.to_string()),
+            ("b.psf".to_string(), shadowsocks()),
         ])
         .err()
         .expect("two defaults must be rejected")
         .to_string();
         assert!(err.contains("a.psf and b.psf"), "{err}");
+    }
+
+    #[test]
+    fn the_shipped_placeholder_password_is_refused() {
+        let err =
+            Dispatch::from_sources(&[("shadowsocks.psf".to_string(), SHADOWSOCKS.to_string())])
+                .err()
+                .expect("the placeholder password must be refused")
+                .to_string();
+        assert!(
+            err.contains("shadowsocks.psf still has the placeholder password"),
+            "{err}"
+        );
     }
 
     #[test]

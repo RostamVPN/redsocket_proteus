@@ -249,7 +249,8 @@ one length field and one payload field per data message, keep the length a
 `u16` so a 64 KiB relay chunk fits, and give the first client message a
 `FIXED_BYTES` or `FIXED_STRING` first field if the PSF is meant to share a
 port with a default one. The server validates every PSF at start-up and
-refuses one that does not compile, naming the file.
+refuses one that does not compile or that still carries the
+`REPLACE_WITH_PASSWORD` placeholder, naming the file.
 
 ### End-to-end script
 
